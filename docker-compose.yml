@@ -1,0 +1,47 @@
+services:
+  server1:
+    image: ubuntu:22.04
+    container_name: server1
+    command: sleep infinity
+    networks:
+      - project-net
+
+  server2:
+    image: ubuntu:22.04
+    container_name: server2
+    command: sleep infinity
+    networks:
+      - project-net
+
+  server3:
+    image: ubuntu:22.04
+    container_name: server3
+    command: sleep infinity
+    networks:
+      - project-net
+
+  client1:
+    image: ubuntu:22.04
+    container_name: client1
+    command: sleep infinity
+    networks:
+      - project-net
+
+  client2:
+    image: ubuntu:22.04
+    container_name: client2
+    command: sleep infinity
+    networks:
+      - project-net
+
+  client3:
+    image: ubuntu:22.04
+    container_name: client3
+    command: sleep infinity
+    networks:
+      - project-net
+
+
+networks:
+  project-net:
+    external: true
