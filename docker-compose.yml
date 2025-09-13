@@ -1,46 +1,47 @@
+x-common: &default-settings
+  build:
+    context: .
+  image: p2p-sim-python:latest
+  command: sleep infinity
+  networks:
+    - project-net
+
 services:
   server1:
-    image: ubuntu:22.04
+    <<: *default-settings
     container_name: server1
-    command: sleep infinity
-    networks:
-      - project-net
+    volumes:
+      - ./server:/home   # mount server code into /home
 
   server2:
-    image: ubuntu:22.04
+    <<: *default-settings
     container_name: server2
-    command: sleep infinity
-    networks:
-      - project-net
+    volumes:
+      - ./server:/home
 
   server3:
-    image: ubuntu:22.04
+    <<: *default-settings
     container_name: server3
-    command: sleep infinity
-    networks:
-      - project-net
+    volumes:
+      - ./server:/home
 
   client1:
-    image: ubuntu:22.04
+    <<: *default-settings
     container_name: client1
-    command: sleep infinity
-    networks:
-      - project-net
+    volumes:
+      - ./client:/home   # mount client code into /home
 
   client2:
-    image: ubuntu:22.04
+    <<: *default-settings
     container_name: client2
-    command: sleep infinity
-    networks:
-      - project-net
+    volumes:
+      - ./client:/home
 
   client3:
-    image: ubuntu:22.04
+    <<: *default-settings
     container_name: client3
-    command: sleep infinity
-    networks:
-      - project-net
-
+    volumes:
+      - ./client:/home
 
 networks:
   project-net:
