@@ -85,6 +85,19 @@ Enter your port: 6000
 
 ---
 
+## Remove Containers
+
+```bash
+docker rm -f $(docker ps -q)
+```
+
+## Split terminal into Panes
+```bash
+tmux
+Ctrl-b %
+Ctrl-b arrow
+```
+
 ## Expected Result
 
 * `client1` sees only itself after first registration.
