@@ -1,8 +1,10 @@
 import socket
 import json
 
-SERVER_HOST = "server1"   # discovery server container name
-SERVER_PORT = 5000
+# Ask user which server to connect to
+SERVER_HOST = input("Enter server hostname [default: server1]: ").strip() or "server1"
+SERVER_PORT = input("Enter server port [default: 5000]: ").strip()
+SERVER_PORT = int(SERVER_PORT) if SERVER_PORT else 5000
 
 def send_message(message):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
