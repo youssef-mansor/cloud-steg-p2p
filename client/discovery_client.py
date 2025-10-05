@@ -1,18 +1,56 @@
-import socket
-import json
+import socket, json, random, time
 
-SERVER_HOST = "server1"   # discovery server container name
-SERVER_PORT = 5000
+SERVERS = [
+    ("server1", 5000),
+    ("server2", 5000),
+    ("server3", 5000),
+]
+FAILED = {}  # map (host, port) -> last_fail_time
+RETRY_AFTER = 10  # seconds
 
 def send_message(message):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((SERVER_HOST, SERVER_PORT))
-        s.sendall(json.dumps(message).encode())
-        data = s.recv(1024).decode()
+    while True:
+        # Choose from healthy servers first, but retry failed ones if enough time passed
+        now = time.time()
+        available = [
+            s for s in SERVERS
+            if s not in FAILED or (now - FAILED[s]) > RETRY_AFTER
+        ]
+
+        if not available:
+            print("DEBUG: no available servers, retrying in 2s...")
+            time.sleep(2)
+            continue
+
+        host, port = random.choice(available)
         try:
-            return json.loads(data)
-        except Exception:
-            return {"status": "error", "message": f"invalid response: {data}"}
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                s.connect((host, port))
+                s.sendall(json.dumps(message).encode())
+                data = s.recv(1024).decode()
+                print(f"DEBUG raw server response from {host}:{port} -> {data}")
+                response = json.loads(data)
+        except Exception as e:
+            print(f"DEBUG: failed to reach {host}:{port} ({e})")
+            FAILED[(host, port)] = time.time()
+            continue
+
+        # --- handle redirect ---
+        if response.get("status") == "redirect":
+            leader = response.get("leader")
+            leader_port = response.get("leader_port")
+            if leader and leader_port:
+                SERVERS.append((leader, int(leader_port)))  # dynamic add if new
+                host, port = leader, int(leader_port)
+                continue
+            return {"status": "error", "message": "invalid redirect info"}
+
+        # success: clear failure mark
+        if (host, port) in FAILED:
+            del FAILED[(host, port)]
+        return response
+
 
 def main():
     print("Discovery Client\nAvailable commands: signup, register, peers, deregister, quit")

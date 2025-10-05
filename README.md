@@ -43,12 +43,13 @@ This starts:
 
 ---
 
-## Run the Server
+## Run the Servers
 
-Inside `server1`:
 
 ```bash
-python3 discovery_server.py
+docker exec -it server1 python3 /home/raft_discovery_server.py --id server1 --peers server2,server3
+docker exec -it server2 python3 /home/raft_discovery_server.py --id server2 --peers server1,server3
+docker exec -it server3 python3 /home/raft_discovery_server.py --id server3 --peers server1,server2
 ```
 
 ---
