@@ -1,1 +1,25 @@
-Problem with redirection.
+I would go with overloading servers and simulating failure.
+what about crash handling for the revived server to catch up.
+
+
+[server1] 01:36:05 Server started (raft scaffold with replication)
+[server1] 01:36:05 Listening on 5000. Peers: ['server2', 'server3']
+[server1] 01:36:12 Starting election for term 1
+[server1] 01:36:12 Election result: 3/3 votes
+[server1] 01:36:12 Became leader (term 1)
+[server1] 01:36:14 Voted for server3 in term 2
+
+
+[server2] 01:36:11 Listening on 5000. Peers: ['server1', 'server3']
+[server2] 01:36:11 Server started (raft scaffold with replication)
+[server2] 01:36:12 Voted for server1 in term 1
+[server2] 01:36:14 Voted for server3 in term 2
+
+
+[server3] 01:36:08 Listening on 5000. Peers: ['server1', 'server2']
+[server3] 01:36:08 Server started (raft scaffold with replication)
+[server3] 01:36:12 Voted for server1 in term 1
+[server3] 01:36:14 Starting election for term 2
+[server3] 01:36:14 Election result: 3/3 votes
+[server3] 01:36:14 Became leader (term 2)
+

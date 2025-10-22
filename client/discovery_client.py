@@ -41,10 +41,20 @@ def send_message(message):
             leader = response.get("leader")
             leader_port = response.get("leader_port")
             if leader and leader_port:
-                SERVERS.append((leader, int(leader_port)))  # dynamic add if new
-                host, port = leader, int(leader_port)
-                continue
-            return {"status": "error", "message": "invalid redirect info"}
+                print(f"DEBUG: redirecting to leader {leader}:{leader_port}")
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(2)
+                        s.connect((leader, leader_port))
+                        s.sendall(json.dumps(message).encode())
+                        data = s.recv(1024).decode()
+                        print(f"DEBUG raw server response from {leader}:{leader_port} -> {data}")
+                        return json.loads(data)
+                except Exception as e:
+                    print(f"DEBUG: failed to reach leader {leader}:{leader_port} ({e})")
+                    FAILED[(leader, leader_port)] = time.time()
+                    continue
+
 
         # success: clear failure mark
         if (host, port) in FAILED:

@@ -23,7 +23,14 @@ voted_for = None
 role = 'follower'       # follower | candidate | leader
 leader = None
 last_heartbeat = time.time()
-lock = threading.Lock()
+lock = threading.RLock()
+log_entries = []       # existing: list of {'term':int,'op':str,'data':dict}
+commit_index = -1      # index (into log_entries) of highest committed entry
+last_applied = -1      # index of highest entry applied to state machine
+# leader-only replication tracking (only used while leader)
+next_index = {}        # peer -> next log index to send (optional)
+match_index = {}       # peer -> highest index known replicated on peer
+
 
 # Minimal app state (leader will handle writes)
 accounts = {}           # username -> password
@@ -36,6 +43,143 @@ election_max = 8.0
 
 def log(msg):
     print(f"[{self_id}] {time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+# ---------------------------
+# apply committed entries to state machine helper
+# ---------------------------  
+def apply_committed_entries():
+    global last_applied, commit_index, accounts, online_clients
+    with lock:
+        while last_applied < commit_index:
+            last_applied += 1
+            entry = log_entries[last_applied]
+            print(f"[{self_id}] DEBUG applying committed entry at idx {last_applied}: {entry}")
+            # print the whole list
+            print(f"[{self_id}] DEBUG full log entries: {log_entries}")
+            op = entry.get('op')
+            data = entry.get('data', {})
+            if op == 'signup':
+                u = data.get('username'); p = data.get('password')
+                if u and p:
+                    accounts[u] = p
+                    log(f"Applied signup for {u} (idx={last_applied})")
+            elif op == 'register':
+                u = data.get('username'); p = data.get('password'); port = data.get('port')
+                if accounts.get(u) == p:
+                    online_clients[u] = (data.get('_client_ip', 'unknown'), port)
+                    log(f"Applied register for {u} (idx={last_applied})")
+            elif op == 'deregister':
+                u = data.get('username'); p = data.get('password')
+                if accounts.get(u) == p:
+                    online_clients.pop(u, None)
+                    log(f"Applied deregister for {u} (idx={last_applied})")
+            else:
+                log(f"Unknown op {op} at idx {last_applied}")
+
+
+# ---------------------------
+# Leader: replicate entry and udpate commit index helper
+# ---------------------------    
+# def replicate_entry_and_commit(entry, timeout=1.5):
+#     """
+#     Leader: send entry to all peers, gather replies, and if majority acked,
+#     update commit_index and apply locally.
+#     """
+#     global commit_index, last_applied, match_index
+
+#     # append to local log first (leader already did this in your flow)
+#     entry_idx = len(log_entries) - 1
+
+#     # send entry to peers and count successes
+#     acks = 1  # leader itself
+#     responses = []
+
+#     for p in peers:
+#         resp = send_rpc(p, PORT, {
+#             'type': 'append_entries',
+#             'term': current_term,
+#             'leader': self_id,
+#             'entries': [entry],
+#             'leader_commit': commit_index
+#         }, timeout=timeout)
+#         if resp and resp.get('status') == 'ok':
+#             acks += 1
+#             match_index[p] = entry_idx
+#         else:
+#             # leave match_index as-is; future heartbeats/replicas can fix up
+#             pass
+
+#     cluster_size = len(peers) + 1
+#     if acks > cluster_size // 2:
+#         with lock:
+#             commit_index = entry_idx
+#         log(f"Entry {entry_idx} committed (acks={acks}/{cluster_size})")
+#         # apply committed entries locally
+#         apply_committed_entries()
+#     else:
+#         log(f"Entry {entry_idx} NOT committed (acks={acks}/{cluster_size})")
+def replicate_entry_and_commit(entry, timeout=1.5):
+    global commit_index, last_applied, match_index, next_index
+
+    # entry index on leader
+    entry_idx = len(log_entries) - 1
+
+    # initialize next_index for any new peer (should be done in become_leader, but be safe)
+    for p in peers:
+        next_index.setdefault(p, len(log_entries))
+        match_index.setdefault(p, -1)
+
+    acks = 1  # leader itself
+
+    for p in peers:
+        # try to replicate until follower accepts or we can't go further back
+        while True:
+            ni = next_index.get(p, len(log_entries))
+            prev_idx = ni - 1
+            prev_term = log_entries[prev_idx]['term'] if prev_idx >= 0 else -1
+            # send all entries from next_index onwards (could be 1 entry or more)
+            entries_to_send = log_entries[ni:]
+            msg = {
+                'type': 'append_entries',
+                'term': current_term,
+                'leader': self_id,
+                'prev_log_index': prev_idx,
+                'prev_log_term': prev_term,
+                'entries': entries_to_send,
+                'leader_commit': commit_index
+            }
+            resp = send_rpc(p, PORT, msg, timeout=timeout)
+            if resp is None:
+                # RPC failure: treat as transient; break and let future heartbeats retry
+                break
+            if resp.get('status') == 'ok':
+                # follower accepted these entries
+                # set match_index and next_index for this follower
+                match_index[p] = entry_idx
+                next_index[p] = entry_idx + 1
+                acks += 1
+                break
+            else:
+                # follower rejected due to prev_log mismatch -> back up next_index and retry
+                # decrement next_index but don't go below 0
+                if ni > 0:
+                    next_index[p] = max(0, ni - 1)
+                    # loop and retry immediately (bounded by next_index lowering)
+                    continue
+                else:
+                    # can't back up further
+                    break
+
+    cluster_size = len(peers) + 1
+    if acks > cluster_size // 2:
+        with lock:
+            commit_index = entry_idx
+        log(f"Entry {entry_idx} committed (acks={acks}/{cluster_size})")
+        apply_committed_entries()
+    else:
+        log(f"Entry {entry_idx} NOT committed (acks={acks}/{cluster_size})")
+
+
 
 # ---------------------------
 # Networking RPC helper
@@ -56,23 +200,84 @@ def send_rpc(host, port, message, timeout=1.5):
 # ---------------------------
 def handle_message(msg, addr):
     global current_term, voted_for, role, leader, last_heartbeat, accounts, online_clients
+    global log_entries, commit_index, last_applied   # <-- ADD THIS LINE
     mtype = msg.get('type')
 
     # --- server RPC: append_entries (heartbeat) ---
+    # if mtype == 'append_entries':
+    #     term = msg.get('term', 0)
+    #     leader_id = msg.get('leader')
+    #     entries = msg.get('entries', [])
+    #     leader_commit = msg.get('leader_commit', None)   # <-- default None
+    #     with lock:
+    #         if term >= current_term:
+    #             current_term = term
+    #             role = 'follower'
+    #             leader = leader_id
+    #             last_heartbeat = time.time()
+    #             if entries:
+    #                 log(f"Received {len(entries)} new entries from {leader_id}")
+    #                 log_entries.extend(entries)
+    #                 print(f"[{self_id}] DEBUG log entries after extend: {log_entries}")
+    #             # update commit index to min(leader_commit, last log index)
+    #             if leader_commit is not None and leader_commit > commit_index:
+    #                 new_commit = min(leader_commit, len(log_entries)-1)
+    #                 commit_index = new_commit
+    #                 log(f"Updated commit_index to {commit_index} from leader {leader_id}")
+    #                 apply_committed_entries()
+    #             return {'status':'ok'}
+    #         else:
+    #             log(f"Ignored outdated heartbeat from {leader_id} (term {term}), current term {current_term}")
+    #             return {'status':'fail', 'term': current_term}
+
+
     if mtype == 'append_entries':
         term = msg.get('term', 0)
         leader_id = msg.get('leader')
+        entries = msg.get('entries', [])
+        leader_commit = msg.get('leader_commit', None)
+        prev_log_index = msg.get('prev_log_index', None)
+        prev_log_term = msg.get('prev_log_term', None)
+
         with lock:
             if term >= current_term:
                 current_term = term
                 role = 'follower'
                 leader = leader_id
                 last_heartbeat = time.time()
-                log(f"Received heartbeat from {leader_id} (term {term})")
-                log(f"Updated leader to {leader}")  # <-- Add this
+
+                # consistency check if leader supplied prev_log info
+                if prev_log_index is not None and prev_log_index >= 0:
+                    if prev_log_index >= len(log_entries) or log_entries[prev_log_index]['term'] != prev_log_term:
+                        # follower's log doesn't match leader at prev_log_index -> reject
+                        log(f"Rejecting append_entries from {leader_id}: prev_log mismatch (prev_idx={prev_log_index})")
+                        return {'status': 'fail'}
+
+                # truncate any conflicting entries and append new ones
+                if entries:
+                    # if prev_log_index is specified, ensure we append after it
+                    if prev_log_index is None:
+                        # default: append after current end
+                        base = len(log_entries) - 1
+                    else:
+                        base = prev_log_index
+                    # drop entries after base
+                    log_entries[:] = log_entries[:base+1]
+                    log_entries.extend(entries)
+                    log(f"Received {len(entries)} new entries from {leader_id}")
+                    print(f"[{self_id}] DEBUG log entries after extend: {log_entries}")
+
+                # update commit index to min(leader_commit, last log index)
+                if leader_commit is not None and leader_commit > commit_index:
+                    new_commit = min(leader_commit, len(log_entries)-1)
+                    commit_index = new_commit
+                    log(f"Updated commit_index to {commit_index} from leader {leader_id}")
+                    apply_committed_entries()
                 return {'status':'ok'}
             else:
+                log(f"Ignored outdated heartbeat from {leader_id} (term {term}), current term {current_term}")
                 return {'status':'fail', 'term': current_term}
+
 
     # --- server RPC: request_vote ---
     if mtype == 'request_vote':
@@ -93,9 +298,11 @@ def handle_message(msg, addr):
 
     # --- client write messages (leader-only) ---
     if mtype in ('signup','register','deregister'):
+        print(f"[{self_id}] DEBUG handling client {mtype} request")
         with lock:
             if role != 'leader':
                 if leader:
+                    print(f"[{self_id}] Redirecting to leader {leader}")
                     return {'status':'redirect', 'leader': leader, 'leader_port': PORT}
                 else:
                     return {'status':'error', 'message':'no-leader-known'}
@@ -106,21 +313,61 @@ def handle_message(msg, addr):
                 if not u or not p: return {'status':'error','message':'missing fields'}
                 if u in accounts: return {'status':'error','message':'exists'}
                 accounts[u] = p
+                # TODO: refactor into function
+                entry = {'term': current_term, 'op': 'signup', 'data': {**msg, '_client_ip': addr[0]}}
+                log_entries.append(entry)
+                print(f"[{self_id}] DEBUG log entries after signup append: {log_entries}")
+                threading.Thread(target=replicate_entry_and_commit, args=(entry,), daemon=True).start()
+                # for p in peers:
+                #     threading.Thread(target=send_rpc, args=(p, PORT, {
+                #         'type': 'append_entries',
+                #         'term': current_term,
+                #         'leader': self_id,
+                #         'entries': [entry]
+                #     }), daemon=True).start()
+                log(f"Replicated {mtype} entry to followers")
                 return {'status':'ok','message':'account created'}
             if mtype == 'register':
                 u = msg.get('username'); p = msg.get('password'); port = msg.get('port')
                 if not u or not p or not port: return {'status':'error','message':'missing fields'}
                 if accounts.get(u) != p: return {'status':'error','message':'auth failed'}
                 online_clients[u] = (addr[0], port)
+                # TODO: refactor into function
+                entry = {'term': current_term, 'op': 'register', 'data': {**msg, '_client_ip': addr[0]}}
+                log_entries.append(entry)
+                print(f"[{self_id}] DEBUG log entries after register append: {log_entries}")
+                threading.Thread(target=replicate_entry_and_commit, args=(entry,), daemon=True).start()
+                # for p in peers:
+                #     threading.Thread(target=send_rpc, args=(p, PORT, {
+                #         'type': 'append_entries',
+                #         'term': current_term,
+                #         'leader': self_id,
+                #         'entries': [entry]
+                #     }), daemon=True).start()
+                log(f"Replicated {mtype} entry to followers")
                 return {'status':'ok','message':'registered'}
             if mtype == 'deregister':
                 u = msg.get('username'); p = msg.get('password')
                 if accounts.get(u) != p: return {'status':'error','message':'auth failed'}
                 online_clients.pop(u, None)
+                # TODO: refactor into function
+                entry = {'term': current_term, 'op': 'deregister', 'data': {**msg, '_client_ip': addr[0]}}
+                log_entries.append(entry)
+                print(f"[{self_id}] DEBUG log entries after deregister append: {log_entries}")
+                threading.Thread(target=replicate_entry_and_commit, args=(entry,), daemon=True).start()
+                # for p in peers:
+                #     threading.Thread(target=send_rpc, args=(p, PORT, {
+                #         'type': 'append_entries',
+                #         'term': current_term,
+                #         'leader': self_id,
+                #         'entries': [entry]
+                #     }), daemon=True).start()
+                log(f"Replicated {mtype} entry to followers")
                 return {'status':'ok','message':'deregistered'}
 
     # --- client read ---
     if mtype == 'peers':
+        print(f"[{self_id}] DEBUG handling client peers request")
         with lock:
             return {'status':'ok','peers': online_clients}
 
@@ -135,12 +382,17 @@ def handle_client(conn, addr):
             data = conn.recv(4096).decode()
             if not data: return
             msg = json.loads(data)
+            print(f"[{self_id}] DEBUG received message from {addr}: {msg}")
         except Exception:
+            print(f"[{self_id}] DEBUG : failed to parse message from {addr}")
             return
         resp = handle_message(msg, addr)
+        print(f"[{self_id}] DEBUG generated response to {addr}: {resp}")
         try:
             conn.sendall(json.dumps(resp).encode())
+            print(f"[{self_id}] DEBUG  sent response to {addr}: {resp}")
         except Exception:
+            print(f"[{self_id}] DEBUG : failed to send response to {addr}")
             pass
 
 # ---------------------------
@@ -152,18 +404,22 @@ def accept_loop():
         s.listen()
         log(f"Listening on {PORT}. Peers: {peers}")
         while True:
-            conn, addr = s.accept()
+            conn, addr = s.accept() # blocking
             threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
 # ---------------------------
 # Election / heartbeats
 # ---------------------------
 def become_leader():
-    global role, leader, voted_for
+    global role, leader, voted_for, next_index, match_index
     with lock:
         role = 'leader'
         leader = self_id
         voted_for = self_id
+        # init indexes
+        next_idx = len(log_entries)     # next index to send
+        next_index = {p: next_idx for p in peers}
+        match_index = {p: -1 for p in peers}
     log(f"Became leader (term {current_term})")
     start_heartbeat()
 
@@ -176,11 +432,27 @@ def start_heartbeat():
                     return
                 term = current_term
                 leader_id = self_id
+                leader_commit = commit_index    # <-- added
             for p in peers:
-                # fire-and-forget heartbeats
-                threading.Thread(target=send_rpc, args=(p, PORT, {'type':'append_entries','term':term,'leader':leader_id}), daemon=True).start()
+                prev_idx = len(log_entries) - 1
+                prev_term = log_entries[prev_idx]['term'] if prev_idx >= 0 else -1
+                threading.Thread(
+                    target=send_rpc,
+                    args=(p, PORT, {
+                        'type': 'append_entries',
+                        'term': term,
+                        'leader': leader_id,
+                        'prev_log_index': prev_idx,
+                        'prev_log_term': prev_term,
+                        'entries': [],              # empty = heartbeat
+                        'leader_commit': leader_commit
+                    }),
+                    daemon=True
+                ).start()
+
             log("Sent heartbeats")
     threading.Thread(target=hb_loop, daemon=True).start()
+
 
 def start_election():
     global current_term, role, voted_for
