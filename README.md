@@ -54,6 +54,19 @@ docker exec -it server3 python3 /home/raft_discovery_server.py --id server3 --pe
 
 ---
 
+## Crash failure tolerance
+
+**Stop Server**
+
+```bash
+docker stop <server#>
+docker start <server#>
+docker exec -it server1 python3 /home/raft_discovery_server.py --id server# --peers server$,server*
+
+```
+
+---
+
 ## Register Clients
 
 Inside `client1`:
