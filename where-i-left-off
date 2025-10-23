@@ -23,3 +23,5 @@ what about crash handling for the revived server to catch up.
 [server3] 01:36:14 Election result: 3/3 votes
 [server3] 01:36:14 Became leader (term 2)
 
+
+when a request happens while the election process is taking places, the servers never settle!

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import socket, json, threading, time, argparse, random
+import socket, json, threading, time, argparse, random, os
 
 # ---------------------------
 # Args / config
@@ -14,6 +14,52 @@ self_id = args.id
 peers = [p for p in args.peers.split(',') if p and p != self_id]
 PORT = args.port
 HOST = '0.0.0.0'
+
+# ---------------------------
+# Log files
+# ---------------------------
+STATE_FILE = f"/{self_id}_state.json"
+LOG_FILE = f"/{self_id}_log.json"
+
+
+def save_state():
+    print(f"[{self_id}] DEBUG saving state to disk")
+    with lock:
+        state = {
+            'current_term': current_term,
+            'voted_for': voted_for,
+            'log_entries': log_entries,
+            'commit_index': commit_index,
+            'last_applied': last_applied,
+            'accounts': accounts,
+            'online_clients': online_clients
+        }
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+            print(f"[{self_id}] DEBUG state saved: {state}")
+        with open(LOG_FILE, 'w') as f:
+            json.dump(log_entries, f)
+            print(f"[{self_id}] DEBUG log entries saved: {log_entries}")
+
+def load_state():
+    global current_term, voted_for, log_entries, commit_index, last_applied, accounts, online_clients
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r') as f:
+            try:
+                state = json.load(f)
+                current_term = state.get('current_term', 0)
+                voted_for = state.get('voted_for')
+                log_entries[:] = state.get('log_entries', [])
+                commit_index = state.get('commit_index', -1)
+                last_applied = state.get('last_applied', -1)
+                accounts = state.get('accounts', {})
+                online_clients = state.get('online_clients', {})
+                log(f"Recovered state from disk: term={current_term}, commit_index={commit_index}, log_len={len(log_entries)}")
+            except Exception as e:
+                log(f"Failed to load state: {e}")
+    else:
+        log("No existing state file; starting fresh")
+
 
 # ---------------------------
 # Raft state & app state
@@ -62,16 +108,19 @@ def apply_committed_entries():
                 u = data.get('username'); p = data.get('password')
                 if u and p:
                     accounts[u] = p
+                    save_state()
                     log(f"Applied signup for {u} (idx={last_applied})")
             elif op == 'register':
                 u = data.get('username'); p = data.get('password'); port = data.get('port')
                 if accounts.get(u) == p:
                     online_clients[u] = (data.get('_client_ip', 'unknown'), port)
+                    save_state()
                     log(f"Applied register for {u} (idx={last_applied})")
             elif op == 'deregister':
                 u = data.get('username'); p = data.get('password')
                 if accounts.get(u) == p:
                     online_clients.pop(u, None)
+                    save_state()
                     log(f"Applied deregister for {u} (idx={last_applied})")
             else:
                 log(f"Unknown op {op} at idx {last_applied}")
@@ -153,15 +202,22 @@ def replicate_entry_and_commit(entry, timeout=1.5):
                 # RPC failure: treat as transient; break and let future heartbeats retry
                 break
             if resp.get('status') == 'ok':
-                # follower accepted these entries
-                # set match_index and next_index for this follower
-                match_index[p] = entry_idx
-                next_index[p] = entry_idx + 1
+                follower_last = resp.get('last_index')
+                print(f"[{self_id}] DEBUG replicate_entry_and_commit: peer {p} responded OK with last_index {follower_last}")
+                if follower_last is not None:
+                    match_index[p] = follower_last
+                    next_index[p] = follower_last + 1
+                    print(f"[{self_id}] DEBUG replicate_entry_and_commit: peer {p} accepted up to index {follower_last}")
+                else:
+                    match_index[p] = entry_idx
+                    next_index[p] = entry_idx + 1
+                    print(f"[{self_id}] DEBUG replicate_entry_and_commit: peer {p} still behind at index {entry_idx}")
                 acks += 1
                 break
             else:
                 # follower rejected due to prev_log mismatch -> back up next_index and retry
                 # decrement next_index but don't go below 0
+                print(f"[{self_id}] DEBUG replicate_entry_and_commit: peer {p} rejected, backing up next_index")
                 if ni > 0:
                     next_index[p] = max(0, ni - 1)
                     # loop and retry immediately (bounded by next_index lowering)
@@ -176,6 +232,7 @@ def replicate_entry_and_commit(entry, timeout=1.5):
             commit_index = entry_idx
         log(f"Entry {entry_idx} committed (acks={acks}/{cluster_size})")
         apply_committed_entries()
+        save_state()
     else:
         log(f"Entry {entry_idx} NOT committed (acks={acks}/{cluster_size})")
 
@@ -273,7 +330,7 @@ def handle_message(msg, addr):
                     commit_index = new_commit
                     log(f"Updated commit_index to {commit_index} from leader {leader_id}")
                     apply_committed_entries()
-                return {'status':'ok'}
+                return {'type':'catchup' ,'status':'ok', 'last_index': len(log_entries)-1}
             else:
                 log(f"Ignored outdated heartbeat from {leader_id} (term {term}), current term {current_term}")
                 return {'status':'fail', 'term': current_term}
@@ -316,6 +373,7 @@ def handle_message(msg, addr):
                 # TODO: refactor into function
                 entry = {'term': current_term, 'op': 'signup', 'data': {**msg, '_client_ip': addr[0]}}
                 log_entries.append(entry)
+                save_state()
                 print(f"[{self_id}] DEBUG log entries after signup append: {log_entries}")
                 threading.Thread(target=replicate_entry_and_commit, args=(entry,), daemon=True).start()
                 # for p in peers:
@@ -335,6 +393,7 @@ def handle_message(msg, addr):
                 # TODO: refactor into function
                 entry = {'term': current_term, 'op': 'register', 'data': {**msg, '_client_ip': addr[0]}}
                 log_entries.append(entry)
+                save_state()
                 print(f"[{self_id}] DEBUG log entries after register append: {log_entries}")
                 threading.Thread(target=replicate_entry_and_commit, args=(entry,), daemon=True).start()
                 # for p in peers:
@@ -353,6 +412,7 @@ def handle_message(msg, addr):
                 # TODO: refactor into function
                 entry = {'term': current_term, 'op': 'deregister', 'data': {**msg, '_client_ip': addr[0]}}
                 log_entries.append(entry)
+                save_state()
                 print(f"[{self_id}] DEBUG log entries after deregister append: {log_entries}")
                 threading.Thread(target=replicate_entry_and_commit, args=(entry,), daemon=True).start()
                 # for p in peers:
@@ -420,8 +480,30 @@ def become_leader():
         next_idx = len(log_entries)     # next index to send
         next_index = {p: next_idx for p in peers}
         match_index = {p: -1 for p in peers}
+        save_state()
+    print(f"[{self_id}] DEBUG next_index on become_leader: {next_index}")
     log(f"Became leader (term {current_term})")
     start_heartbeat()
+
+def send_append(p, prev_idx, prev_term, entries_to_send, term, leader_id, leader_commit):
+    msg = {
+        'type': 'append_entries',
+        'term': term,
+        'leader': leader_id,
+        'prev_log_index': prev_idx,
+        'prev_log_term': prev_term,
+        'entries': entries_to_send,
+        'leader_commit': leader_commit
+    }
+    resp = send_rpc(p, PORT, msg)
+    if resp and resp.get('status') == 'ok':
+        follower_last = resp.get('last_index')
+        with lock:
+            if follower_last is not None:
+                match_index[p] = follower_last
+                next_index[p] = follower_last + 1
+
+
 
 def start_heartbeat():
     def hb_loop():
@@ -434,23 +516,18 @@ def start_heartbeat():
                 leader_id = self_id
                 leader_commit = commit_index    # <-- added
             for p in peers:
-                prev_idx = len(log_entries) - 1
+                # prev_idx = len(log_entries) - 1
+                ni = next_index.get(p, len(log_entries))
+                prev_idx = ni - 1
                 prev_term = log_entries[prev_idx]['term'] if prev_idx >= 0 else -1
+                entries_to_send = log_entries[ni:] if ni < len(log_entries) else []
                 threading.Thread(
-                    target=send_rpc,
-                    args=(p, PORT, {
-                        'type': 'append_entries',
-                        'term': term,
-                        'leader': leader_id,
-                        'prev_log_index': prev_idx,
-                        'prev_log_term': prev_term,
-                        'entries': [],              # empty = heartbeat
-                        'leader_commit': leader_commit
-                    }),
+                    target=send_append,
+                    args=(p, prev_idx, prev_term, entries_to_send, term, leader_id, leader_commit),
                     daemon=True
                 ).start()
-
             log("Sent heartbeats")
+            print(f"[{self_id}] DEBUG next_index on become_leader: {next_index}")
     threading.Thread(target=hb_loop, daemon=True).start()
 
 
@@ -461,6 +538,7 @@ def start_election():
         term = current_term
         role = 'candidate'
         voted_for = self_id
+        save_state()
     log(f"Starting election for term {term}")
     votes = 1
     for p in peers:
@@ -492,6 +570,8 @@ def election_timer():
 # Main
 # ---------------------------
 if __name__ == '__main__':
+    load_state()
+    print(f"[{self_id}] DEBUG initial log entries: {log_entries}")
     threading.Thread(target=accept_loop, daemon=True).start()
     threading.Thread(target=election_timer, daemon=True).start()
     log("Server started (raft scaffold)")
