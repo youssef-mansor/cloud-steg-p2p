@@ -56,3 +56,5 @@ pub enum RpcMessage {
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
 }
+
+pub mod rpc;
