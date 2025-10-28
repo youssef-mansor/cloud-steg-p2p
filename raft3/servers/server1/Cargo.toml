@@ -1,0 +1,9 @@
+[package]
+name = "server1"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+proto = { path = "../../proto" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

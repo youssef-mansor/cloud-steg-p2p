@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "proto",
+    "servers/server1",
+    "servers/server2",
+    "servers/server3",
+]
+resolver = "2"
