@@ -173,6 +173,7 @@ dependencies = [
 name = "server1"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "proto",
  "tokio",
  "tracing",
@@ -182,6 +183,7 @@ dependencies = [
 name = "server2"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "proto",
  "tokio",
  "tracing",
@@ -191,6 +193,7 @@ dependencies = [
 name = "server3"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "proto",
  "tokio",
  "tracing",
