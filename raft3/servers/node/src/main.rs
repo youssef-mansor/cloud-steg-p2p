@@ -39,15 +39,14 @@ async fn election_timer_task(
         // Trigger election
         {
             let mut st = state.lock().await;
-            if st.is_follower() {
-                let new_term = st.start_election(id);
-                println!(
-                    "[Node {}] Election timeout → starting election (term {})",
-                    id, new_term
-                );
-            } else {
-                continue; // already candidate/leader
+            if !st.is_follower() {
+                continue; // already candidate/leader, skip election
             }
+            let new_term = st.start_election(id);
+            println!(
+                "[Node {}] Election timeout → starting election (term {})",
+                id, new_term
+            );
         }
 
         // Broadcast RequestVote to peers
@@ -119,7 +118,8 @@ async fn main() -> anyhow::Result<()> {
 
                 if st.role == proto::state::Role::Candidate && resp.vote_granted {
                     st.votes_received += 1;
-                    let majority = (st.peers_count / 2) + 1;
+                    let total_nodes = st.peers_count + 1;
+                    let majority = (total_nodes / 2) + 1;
 
                     if st.votes_received >= majority {
                         st.role = proto::state::Role::Leader;
