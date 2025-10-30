@@ -81,10 +81,19 @@ async fn election_timer_task(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let state = Arc::new(Mutex::new(NodeState::new()));
+    // Set peers_count in NodeState
+    if let Some(ref peer_str) = args.peers {
+        let peers: Vec<_> = peer_str.split(',').map(|s| s.trim().to_string()).collect();
+        {
+            let mut st = state.lock().await;
+            st.peers_count = peers.len();
+        }
+    }
+
     let listen_addr = format!("0.0.0.0:{}", args.port);
     println!("Node {} listening on {}", args.id, listen_addr);
 
-    let state = Arc::new(Mutex::new(NodeState::new()));
 
     let state_listener = state.clone();
     let listener_task = task::spawn(async move {
@@ -102,6 +111,23 @@ async fn main() -> anyhow::Result<()> {
                 let reply = RpcMessage::RequestVoteResponse(resp.clone());
                 send_message(&mut socket, &reply).await.unwrap();
                 println!("Sent response: {:?}", reply);
+            } else if let RpcMessage::RequestVoteResponse(resp) = msg {
+                let mut st = state_listener.lock().await;
+
+                if st.role == proto::state::Role::Candidate && resp.vote_granted {
+                    st.votes_received += 1;
+                    let majority = (st.peers_count / 2) + 1;
+
+                    if st.votes_received >= majority {
+                        st.role = proto::state::Role::Leader;
+                        println!(
+                            "[Node {}] became LEADER for term {} (votes: {})",
+                            st.voted_for.unwrap_or(0),
+                            st.current_term,
+                            st.votes_received
+                        );
+                    }
+                }
             }
         }
     });

@@ -13,6 +13,8 @@ pub struct NodeState {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
     pub role: Role,
+    pub votes_received: usize,
+    pub peers_count: usize,
 }
 
 impl NodeState {
@@ -21,6 +23,8 @@ impl NodeState {
             current_term: 0,
             voted_for: None,
             role: Role::Follower,
+            votes_received: 0,
+            peers_count: 0,
         }
     }
 
@@ -51,12 +55,15 @@ impl NodeState {
     /// - becomes Candidate
     /// - records vote for self (candidate_id)
     /// Returns the new term.
-    pub fn start_election(&mut self, candidate_id: NodeId) -> Term {
-        self.current_term = self.current_term.saturating_add(1);
+    pub fn start_election(&mut self, id: NodeId) -> Term {
+        self.current_term += 1;
+        self.voted_for = Some(id);
         self.role = Role::Candidate;
-        self.voted_for = Some(candidate_id);
+        self.votes_received = 1; // ✅ vote for self
+        println!("[Node {}] started election for term {}", id, self.current_term);
         self.current_term
     }
+
 
     /// Mark this node as leader.
     pub fn become_leader(&mut self) {
