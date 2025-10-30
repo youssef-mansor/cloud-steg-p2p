@@ -10,6 +10,22 @@ use std::sync::Arc;
 use rand::{thread_rng, Rng};
 use tokio::time::{sleep, Duration};
 
+async fn connect_with_retry(addr: &str, retries: usize) -> Option<TcpStream> {
+    use tokio::time::{sleep, Duration};
+    for attempt in 1..=retries {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Some(stream),
+            Err(e) => {
+                eprintln!("[connect] failed to connect to {addr} (attempt {attempt}): {e}");
+                sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+    eprintln!("[connect] giving up on {addr} after {retries} attempts");
+    None
+}
+
+
 /// Command-line arguments
 #[derive(Parser, Debug)]
 struct Args {
@@ -31,8 +47,8 @@ async fn send_request_vote_once(
     id: NodeId,
     state: Arc<Mutex<NodeState>>,
 ) {
-    match TcpStream::connect(target).await {
-        Ok(mut stream) => {
+    match connect_with_retry(target, 5).await {
+        Some(mut stream) => {
             let req = RpcMessage::RequestVote(RequestVote {
                 term: state.lock().await.current_term,
                 candidate_id: id,
@@ -62,8 +78,8 @@ async fn send_request_vote_once(
                 }
             }
         }
-        Err(e) => {
-            println!("[Node {}] connect to {} failed: {}", id, target, e);
+        None => {
+            println!("[Node {}] failed to reach {} after retries", id, target);
         }
     }
 }
@@ -73,8 +89,8 @@ async fn send_append_entries_once(
     id: NodeId,
     state: Arc<Mutex<NodeState>>,
 ) {
-    match TcpStream::connect(target).await {
-        Ok(mut stream) => {
+    match connect_with_retry(target, 5).await {
+        Some(mut stream) => {
             let msg = RpcMessage::AppendEntries(AppendEntries {
                 term: state.lock().await.current_term,
                 leader_id: id,
@@ -96,9 +112,10 @@ async fn send_append_entries_once(
                 }
             }
         }
-        Err(e) => {
-            println!("[Node {}] heartbeat connect to {} failed: {}", id, target, e);
+        None => {
+            println!("[Node {}] heartbeat to {} failed after retries", id, target);
         }
+
     }
 }
 
@@ -120,8 +137,11 @@ async fn election_timer_task(
         drop(st); // release lock before contacting peers
 
         // existing RequestVote broadcast code here (unchanged)
-        for target in &peers {
-            // send RequestVote...
+        for target in peers.clone() {
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                send_request_vote_once(&target, id, state_clone).await;
+            });
         }
     }
 }
@@ -232,6 +252,26 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             election_timer_task(args.id, peers_clone, state_clone).await;
         });
+        // Heartbeat sender for leaders
+        let state_clone2 = state.clone();
+        let peers_clone2 = peers.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_millis(100)).await;
+                let st = state_clone2.lock().await;
+                if st.is_leader() {
+                    drop(st);
+                    for target in peers_clone2.clone() {
+                        let state2 = state_clone2.clone();
+                        tokio::spawn(async move {
+                            send_append_entries_once(&target, args.id, state2).await;
+                        });
+                    }
+
+                }
+            }
+        });
+
     }
 
     // block until listener exits (never)
