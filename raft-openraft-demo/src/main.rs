@@ -1,15 +1,19 @@
 mod types;
 mod store;
 mod network;
+mod api;
+mod rpc;
+mod rpc_handler;
 
 use std::sync::Arc;
 use clap::Parser;
-use tokio::net::TcpListener;
 use anyhow::Result;
 use openraft::{Config, Raft};
 use openraft::storage::Adaptor;
 use network::NetworkFactory;
 use openraft_memstore::MemStore;
+use api::AppState;
+use rpc_handler::start_rpc_server;
 
 pub type NodeId = u64;
 
@@ -21,28 +25,33 @@ struct Args {
     #[clap(long)]
     id: u64,
 
-    /// Listening address, e.g. 0.0.0.0:7000
+    /// HTTP API address, e.g. 0.0.0.0:8000
     #[clap(long)]
-    addr: String,
+    http_addr: String,
 
-    /// Comma-separated peer addresses, e.g. "10.40.56.135:7001,10.40.56.136:7002"
+    /// Raft RPC address (for internal cluster communication)
+    #[clap(long)]
+    rpc_addr: String,
+
+    /// Comma-separated peer addresses, e.g. "2=127.0.0.1:7002,3=127.0.0.1:7003"
     #[clap(long)]
     peers: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing for better logging
     tracing_subscriber::fmt()
-        .with_target(true)
-        .with_thread_ids(true)
+        .with_target(false)
+        .with_thread_ids(false)
         .with_level(true)
+        .compact()
         .init();
 
     let args = Args::parse();
-    println!("🚀 Node {} starting on {}", args.id, args.addr);
+    println!("🚀 Node {} starting", args.id);
+    println!("   HTTP API: {}", args.http_addr);
+    println!("   Raft RPC: {}", args.rpc_addr);
 
-    // Raft config
     let config = Config {
         cluster_name: "example-cluster".to_string(),
         heartbeat_interval: 500,
@@ -50,53 +59,49 @@ async fn main() -> Result<()> {
         election_timeout_max: 3000,
         ..Default::default()
     };
-    
+
     let config = Arc::new(config.validate()?);
-    println!("✓ Raft configuration validated");
-    
-    // Create network factory
+
     let network_factory = NetworkFactory::new();
-    
-    // Parse and register peer addresses if provided
+
     if let Some(peers_str) = &args.peers {
-        for (idx, peer_addr) in peers_str.split(',').enumerate() {
-            let peer_id = (idx + 2) as NodeId; // Assuming this is node 1, peers are 2, 3, etc.
-            network_factory.add_peer(peer_id, peer_addr.trim().to_string()).await;
+        for peer in peers_str.split(',') {
+            if let Some((id_str, addr)) = peer.split_once('=') {
+                let peer_id: NodeId = id_str.trim().parse()?;
+                network_factory.add_peer(peer_id, addr.trim().to_string()).await;
+            }
         }
     }
-    println!("✓ RaftNetwork created");
-    
-    // Create storage - MemStore implements RaftStorage
+
     let store = MemStore::new_async().await;
-    println!("✓ RaftStorage created");
-    
-    // Create Adaptor which splits the storage into log and state machine
     let (log_store, state_machine) = Adaptor::new(store);
-    
-    // Create the Raft instance
-    let raft = Raft::new(
-        args.id,
-        config.clone(),
-        network_factory,
-        log_store,
-        state_machine,
-    ).await?;
-    
-    println!("✓ Raft instance created");
-    println!("📊 Node {} is ready (not yet initialized as cluster)", args.id);
-    println!();
-    println!("Next steps:");
-    println!("  1. Initialize this node as a single-node cluster");
-    println!("  2. Add other nodes as learners");
-    println!("  3. Change membership to add them as voters");
-    println!();
 
-    let listener = TcpListener::bind(&args.addr).await?;
-    println!("🔌 Listening on {}", args.addr);
+    let raft = Raft::new(args.id, config.clone(), network_factory, log_store, state_machine).await?;
+    let raft = Arc::new(raft);
 
-    loop {
-        let (socket, peer_addr) = listener.accept().await?;
-        println!("📥 Accepted connection from {}", peer_addr);
-        drop(socket);
-    }
+    println!("✅ Raft node created");
+
+    // Start RPC server in background
+    let rpc_raft = raft.clone();
+    let rpc_addr = args.rpc_addr.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_rpc_server(rpc_addr, rpc_raft).await {
+            eprintln!("RPC server error: {}", e);
+        }
+    });
+
+    // Start HTTP server
+    let app_state = AppState {
+        raft: raft.clone(),
+        node_id: args.id,
+    };
+
+    let app = api::create_router(app_state);
+    let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
+
+    println!("🌐 HTTP API listening on {}", args.http_addr);
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }

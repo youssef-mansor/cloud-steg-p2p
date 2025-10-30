@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.100"
 axum = "0.7"
+bincode = "1.3"
 clap = { version = "4.5.51", features = ["derive"] }
 openraft = "0.9.21"
 openraft-memstore = "0.9.21"
