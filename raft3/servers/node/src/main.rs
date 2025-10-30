@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 use rand::{thread_rng, Rng};
 use tokio::time::{sleep, Duration};
+use std::time::Instant;
 
 /// Command-line arguments
 #[derive(Parser, Debug)]
@@ -26,6 +27,19 @@ struct Args {
     peers: Option<String>,
 }
 
+impl NodeState {
+    pub fn new() -> Self {
+        Self {
+            current_term: 0,
+            voted_for: None,
+            role: Role::Follower,
+            votes_received: 0,
+            peers_count: 0,
+            last_heard: Instant::now(),
+        }
+    }
+}
+
 async fn election_timer_task(
     id: NodeId,
     peers: Vec<String>,
@@ -41,6 +55,9 @@ async fn election_timer_task(
             let mut st = state.lock().await;
             if !st.is_follower() {
                 continue; // already candidate/leader, skip election
+            }
+            if st.last_heard.elapsed().as_millis() < 150 {
+                continue; // heard from leader/candidate recently
             }
             let new_term = st.start_election(id);
             println!(
@@ -107,15 +124,15 @@ async fn main() -> anyhow::Result<()> {
             let msg = read_message(&mut socket).await.unwrap();
             println!("Received: {:?}", msg);
 
+            let mut st = state_listener.lock().await;
+            st.last_heard = Instant::now();
+
             if let RpcMessage::RequestVote(req) = msg {
-                let mut st = state_listener.lock().await; // ✅ async lock
                 let resp = st.handle_request_vote(&req);
                 let reply = RpcMessage::RequestVoteResponse(resp.clone());
                 send_message(&mut socket, &reply).await.unwrap();
                 println!("Sent response: {:?}", reply);
             } else if let RpcMessage::RequestVoteResponse(resp) = msg {
-                let mut st = state_listener.lock().await;
-
                 if st.role == proto::state::Role::Candidate && resp.vote_granted {
                     st.votes_received += 1;
                     let total_nodes = st.peers_count + 1;
@@ -129,8 +146,44 @@ async fn main() -> anyhow::Result<()> {
                             st.current_term,
                             st.votes_received
                         );
+
+                        let peers_clone = peers.clone();
+                        let state_clone = state.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                {
+                                    let st = state_clone.lock().await;
+                                    if !st.is_leader() {
+                                        break;
+                                    }
+                                }
+                                for target in &peers_clone {
+                                    let mut stream = match TcpStream::connect(target).await {
+                                        Ok(s) => s,
+                                        Err(_) => continue,
+                                    };
+                                    let msg = RpcMessage::AppendEntries(AppendEntries {
+                                        term: state_clone.lock().await.current_term,
+                                        leader_id: args.id,
+                                        prev_log_index: 0,
+                                        prev_log_term: 0,
+                                        entries: vec![],
+                                        leader_commit: 0,
+                                    });
+                                    let _ = send_message(&mut stream, &msg).await;
+                                }
+                                sleep(Duration::from_millis(50)).await;
+                            }
+                        });
                     }
                 }
+            } else if let RpcMessage::AppendEntries(req) = msg {
+                st.last_heard = Instant::now();
+                if req.term >= st.current_term {
+                    st.role = proto::state::Role::Follower;
+                    st.current_term = req.term;
+                }
+                // Optionally: send AppendEntriesResponse
             }
         }
     });
