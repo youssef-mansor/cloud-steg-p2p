@@ -10,7 +10,6 @@ use std::sync::Arc;
 use rand::{thread_rng, Rng};
 use tokio::time::{sleep, Duration};
 
-
 /// Command-line arguments
 #[derive(Parser, Debug)]
 struct Args {
@@ -53,11 +52,16 @@ async fn election_timer_task(
 
         // Broadcast RequestVote to peers
         for target in &peers {
-            let mut stream = match TcpStream::connect(target).await {
-                Ok(s) => s,
-                Err(e) => {
-                    println!("[Node {}] connect to {} failed: {}", id, target, e);
-                    continue;
+            let mut stream = loop {
+                match TcpStream::connect(target).await {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        println!(
+                            "[Node {}] connect to {} failed: {}. Retrying in 200ms...",
+                            id, target, e
+                        );
+                        sleep(Duration::from_millis(200)).await;
+                    }
                 }
             };
 
@@ -69,14 +73,14 @@ async fn election_timer_task(
             });
 
             if let Err(e) = send_message(&mut stream, &msg).await {
-                println!("[Node {}] send to {} failed: {}", id, target, e);
+                println!("[Node {}] send to {} failed: {}. Skipping this peer.", id, target, e);
                 continue;
             }
+
             println!("[Node {}] sent RequestVote → {}", id, target);
         }
-    }
-}
-
+    } // <-- added closing brace for loop
+} // <-- added closing brace for function
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -93,7 +97,6 @@ async fn main() -> anyhow::Result<()> {
 
     let listen_addr = format!("0.0.0.0:{}", args.port);
     println!("Node {} listening on {}", args.id, listen_addr);
-
 
     let state_listener = state.clone();
     let listener_task = task::spawn(async move {
@@ -131,7 +134,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-
 
     // If peers are provided, send RequestVote to them
     if let Some(ref peer_str) = args.peers {

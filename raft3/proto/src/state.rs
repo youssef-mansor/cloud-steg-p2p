@@ -30,25 +30,29 @@ impl NodeState {
 
     /// Handle a RequestVote RPC and return a response.
     pub fn handle_request_vote(&mut self, req: &RequestVote) -> RequestVoteResponse {
-        // If candidate has higher term, update.
+        // Step 1: update term if needed
         if req.term > self.current_term {
             self.current_term = req.term;
             self.voted_for = None;
             self.role = Role::Follower;
         }
 
-        let can_vote = (self.voted_for.is_none() || self.voted_for == Some(req.candidate_id))
-            && req.term >= self.current_term;
-
-        if can_vote {
+        // Step 2: grant vote if term is up-to-date and we haven't voted yet
+        let vote_granted = if req.term == self.current_term
+            && (self.voted_for.is_none() || self.voted_for == Some(req.candidate_id))
+        {
             self.voted_for = Some(req.candidate_id);
-        }
+            true
+        } else {
+            false
+        };
 
         RequestVoteResponse {
             term: self.current_term,
-            vote_granted: can_vote,
+            vote_granted,
         }
     }
+
 
     /// Start a new election for `candidate_id`.
     /// - increments term
