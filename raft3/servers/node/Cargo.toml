@@ -8,3 +8,4 @@ proto = { path = "../../proto" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+rand = "0.8"

@@ -7,6 +7,9 @@ use tokio::{net::{TcpListener, TcpStream}, task};
 use clap::Parser;
 use tokio::sync::Mutex;
 use std::sync::Arc;
+use rand::{thread_rng, Rng};
+use tokio::time::{sleep, Duration};
+
 
 /// Command-line arguments
 #[derive(Parser, Debug)]
@@ -23,6 +26,57 @@ struct Args {
     #[arg(long)]
     peers: Option<String>,
 }
+
+async fn election_timer_task(
+    id: NodeId,
+    peers: Vec<String>,
+    state: Arc<tokio::sync::Mutex<proto::state::NodeState>>,
+) {
+    loop {
+        // Random timeout between 150–300 ms
+        let timeout = thread_rng().gen_range(150..=300);
+        sleep(Duration::from_millis(timeout)).await;
+
+        // Trigger election
+        {
+            let mut st = state.lock().await;
+            if st.is_follower() {
+                let new_term = st.start_election(id);
+                println!(
+                    "[Node {}] Election timeout → starting election (term {})",
+                    id, new_term
+                );
+            } else {
+                continue; // already candidate/leader
+            }
+        }
+
+        // Broadcast RequestVote to peers
+        for target in &peers {
+            let mut stream = match TcpStream::connect(target).await {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("[Node {}] connect to {} failed: {}", id, target, e);
+                    continue;
+                }
+            };
+
+            let msg = RpcMessage::RequestVote(RequestVote {
+                term: state.lock().await.current_term,
+                candidate_id: id,
+                last_log_index: 0,
+                last_log_term: 0,
+            });
+
+            if let Err(e) = send_message(&mut stream, &msg).await {
+                println!("[Node {}] send to {} failed: {}", id, target, e);
+                continue;
+            }
+            println!("[Node {}] sent RequestVote → {}", id, target);
+        }
+    }
+}
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
 
 
     // If peers are provided, send RequestVote to them
-    if let Some(peer_str) = args.peers {
+    if let Some(ref peer_str) = args.peers {
         let peers: Vec<_> = peer_str.split(',').map(|s| s.trim().to_string()).collect();
         for target in peers {
             if target.is_empty() {
@@ -79,6 +133,13 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => println!("Failed to connect to {}: {}", target, e),
             }
         }
+    }
+
+    // Spawn election timer if peers are defined
+    if let Some(ref peer_str) = args.peers {
+        let peers: Vec<_> = peer_str.split(',').map(|s| s.trim().to_string()).collect();
+        let state_clone = state.clone();
+        tokio::spawn(election_timer_task(args.id, peers, state_clone));
     }
 
     listener_task.await?;
