@@ -1,5 +1,14 @@
-use crate::{NodeId, RequestVote, RequestVoteResponse, Term};
+use crate::{
+    NodeId, RequestVote, RequestVoteResponse, Term,
+    AppendEntries, AppendEntriesResponse,
+};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
+
+/// helper used by serde to provide a default value for the skipped Instant field
+fn instant_now() -> Instant {
+    Instant::now()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -15,6 +24,10 @@ pub struct NodeState {
     pub role: Role,
     pub votes_received: usize,
     pub peers_count: usize,
+
+    /// skipped for serde, but provide a default initializer so Deserialize works
+    #[serde(skip, default = "instant_now")]
+    pub last_heartbeat: Instant,
 }
 
 impl NodeState {
@@ -25,6 +38,7 @@ impl NodeState {
             role: Role::Follower,
             votes_received: 0,
             peers_count: 0,
+            last_heartbeat: Instant::now(),
         }
     }
 
@@ -53,22 +67,25 @@ impl NodeState {
         }
     }
 
-    /// ✅ Handle AppendEntries RPC (heartbeats / log replication)
-    pub fn handle_append_entries(&mut self, req: &crate::AppendEntries) -> crate::AppendEntriesResponse {
-        // Reject outdated terms
+    /// Handle AppendEntries (heartbeat or log replication)
+    pub fn handle_append_entries(&mut self, req: &AppendEntries) -> AppendEntriesResponse {
         if req.term < self.current_term {
-            return crate::AppendEntriesResponse {
+            return AppendEntriesResponse {
                 term: self.current_term,
                 success: false,
             };
         }
 
-        // Accept heartbeat / append entries
-        self.current_term = req.term;
-        self.role = Role::Follower;
-        self.voted_for = Some(req.leader_id);
+        if req.term > self.current_term {
+            self.current_term = req.term;
+            self.role = Role::Follower;
+            self.voted_for = None;
+        }
 
-        crate::AppendEntriesResponse {
+        // ✅ Reset heartbeat timer (very important)
+        self.last_heartbeat = Instant::now();
+
+        AppendEntriesResponse {
             term: self.current_term,
             success: true,
         }
@@ -84,6 +101,7 @@ impl NodeState {
         self.current_term
     }
 
+    /// Mark this node as leader.
     pub fn become_leader(&mut self) {
         self.role = Role::Leader;
     }
