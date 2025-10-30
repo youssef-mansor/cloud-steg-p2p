@@ -53,23 +53,37 @@ impl NodeState {
         }
     }
 
+    /// ✅ Handle AppendEntries RPC (heartbeats / log replication)
+    pub fn handle_append_entries(&mut self, req: &crate::AppendEntries) -> crate::AppendEntriesResponse {
+        // Reject outdated terms
+        if req.term < self.current_term {
+            return crate::AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+            };
+        }
+
+        // Accept heartbeat / append entries
+        self.current_term = req.term;
+        self.role = Role::Follower;
+        self.voted_for = Some(req.leader_id);
+
+        crate::AppendEntriesResponse {
+            term: self.current_term,
+            success: true,
+        }
+    }
 
     /// Start a new election for `candidate_id`.
-    /// - increments term
-    /// - becomes Candidate
-    /// - records vote for self (candidate_id)
-    /// Returns the new term.
     pub fn start_election(&mut self, id: NodeId) -> Term {
         self.current_term += 1;
         self.voted_for = Some(id);
         self.role = Role::Candidate;
-        self.votes_received = 1; // ✅ vote for self
+        self.votes_received = 1; // vote for self
         println!("[Node {}] started election for term {}", id, self.current_term);
         self.current_term
     }
 
-
-    /// Mark this node as leader.
     pub fn become_leader(&mut self) {
         self.role = Role::Leader;
     }
