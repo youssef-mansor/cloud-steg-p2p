@@ -58,3 +58,4 @@ pub enum RpcMessage {
 }
 
 pub mod rpc;
+pub mod state;
