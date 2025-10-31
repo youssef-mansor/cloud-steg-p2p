@@ -1,5 +1,5 @@
 use crate::rpc::{RaftMessage, RpcResponse, serialize_response};
-use openraft::Raft;
+use openraft::{Raft, Vote};
 use openraft_memstore::TypeConfig;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -76,20 +76,79 @@ async fn handle_rpc_connection(
 async fn handle_message(msg: RaftMessage, raft: Arc<RaftNode>) -> Option<RpcResponse> {
     match msg {
         RaftMessage::AppendEntries(req) => {
-            println!("📥 AppendEntries from term {}", req.vote.leader_id.term);
+            let current_metrics = raft.metrics().borrow().clone();
+            let req_term = req.vote.leader_id.term;
+            let req_leader = req.vote.leader_id.node_id;
+            
+            // Critical: If we're a leader but receive AppendEntries from a higher term, we must step down
+            if matches!(current_metrics.state, openraft::ServerState::Leader) && req_term > current_metrics.current_term {
+                println!("🚨 CRITICAL: Leader node received AppendEntries from higher term {} (our term: {}), must step down!", 
+                         req_term, current_metrics.current_term);
+            }
+            
+            println!("📥 AppendEntries: term {} from leader {}, current_term={}, state={:?}", 
+                     req_term, req_leader, current_metrics.current_term, current_metrics.state);
+            
             match raft.append_entries(req).await {
-                Ok(resp) => Some(crate::rpc::RpcResponse::AppendEntries(resp)),
+                Ok(resp) => {
+                    let new_metrics = raft.metrics().borrow().clone();
+                    if resp.is_success() {
+                        println!("✅ AppendEntries succeeded");
+                    } else {
+                        println!("⚠️  AppendEntries rejected (likely log mismatch or wrong term)");
+                    }
+                    
+                    // Log if state changed after processing AppendEntries
+                    if new_metrics.state != current_metrics.state {
+                        println!("🔄 State changed after AppendEntries: {:?} -> {:?}", 
+                                current_metrics.state, new_metrics.state);
+                    }
+                    
+                    Some(crate::rpc::RpcResponse::AppendEntries(resp))
+                },
                 Err(e) => {
-                    println!("❌ AppendEntries error: {}", e);
+                    println!("❌ AppendEntries error: {} - Cannot send proper response, this may cause timeout", e);
+                    // Unfortunately, we cannot construct AppendEntriesResponse manually as it's an internal type
+                    // The error/panic means OpenRaft couldn't process it, so we return None
+                    // This will cause the leader to timeout, but it's better than crashing
+                    // The leader will eventually detect the node is unresponsive
                     None
                 }
             }
         }
 
         RaftMessage::Vote(req) => {
-            println!("📥 Vote request from leader term {}", req.vote.leader_id.term);
+            let current_metrics = raft.metrics().borrow().clone();
+            let req_term = req.vote.leader_id.term;
+            let req_node = req.vote.leader_id.node_id;
+            
+            // Critical: If we're a leader but receive Vote request from a higher term, we must step down
+            if matches!(current_metrics.state, openraft::ServerState::Leader) && req_term > current_metrics.current_term {
+                println!("🚨 CRITICAL: Leader node received Vote request from higher term {} (our term: {}), must step down!", 
+                         req_term, current_metrics.current_term);
+            }
+            
+            println!("📥 Vote request: term {} from node {}, current_term={}, current_leader={:?}, state={:?}", 
+                     req_term, req_node, current_metrics.current_term, current_metrics.current_leader, current_metrics.state);
             match raft.vote(req).await {
-                Ok(resp) => Some(crate::rpc::RpcResponse::Vote(resp)),
+                Ok(resp) => {
+                    let new_metrics = raft.metrics().borrow().clone();
+                    println!("✅ Vote response: granted={}", resp.vote_granted);
+                    
+                    // Log if state changed after voting
+                    if new_metrics.state != current_metrics.state {
+                        println!("🔄 State changed after Vote: {:?} -> {:?}", 
+                                current_metrics.state, new_metrics.state);
+                    }
+                    
+                    // Log if term changed
+                    if new_metrics.current_term != current_metrics.current_term {
+                        println!("📈 Term updated after Vote: {} -> {}", 
+                                current_metrics.current_term, new_metrics.current_term);
+                    }
+                    
+                    Some(crate::rpc::RpcResponse::Vote(resp))
+                },
                 Err(e) => {
                     println!("❌ Vote error: {}", e);
                     None
