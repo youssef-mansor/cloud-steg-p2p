@@ -56,4 +56,5 @@ echo ""
 echo "✅ Leader found, now testing through load balancer..."
 echo ""
 echo "🧪 Running load balancer tests..."
-python3 test_lb.py
+python3 test_clustered_lb.py
+
