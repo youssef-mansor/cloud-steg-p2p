@@ -168,7 +168,7 @@ class ClusteredLBHandler(BaseHTTPRequestHandler):
                         f"{backend_url}{self.path}",
                         data=body,
                         headers=dict(self.headers),
-                        timeout=5  # Shorter timeout for quick failure detection
+                        timeout=5
                     )
                 else:
                     # GET request
@@ -181,8 +181,13 @@ class ClusteredLBHandler(BaseHTTPRequestHandler):
                     # Success!
                     print(f"✅ LB{self.lb_id} Got response from Server {backend_id} ({len(response.content)} bytes)", flush=True)
                     self.send_response(200)
+                    
+                    # ← ADD THIS: Include which server handled it
+                    self.send_header('X-Backend-Server', str(backend_id))
+                    self.send_header('X-Load-Balancer', str(self.lb_id))
+                    
                     for header, value in response.headers.items():
-                        if header.lower() not in ['content-encoding', 'transfer-encoding']:
+                        if header.lower() not in ['content-encoding', 'transfer-encoding', 'x-backend-server', 'x-load-balancer']:
                             self.send_header(header, value)
                     self.end_headers()
                     self.wfile.write(response.content)
@@ -190,7 +195,6 @@ class ClusteredLBHandler(BaseHTTPRequestHandler):
                 else:
                     # Bad status code
                     print(f"❌ LB{self.lb_id} Server {backend_id} returned HTTP {response.status_code}", flush=True)
-                    # Mark as potentially dead and try next
                     if attempt < len(backends_to_try) - 1:
                         continue
             
@@ -221,6 +225,7 @@ class ClusteredLBHandler(BaseHTTPRequestHandler):
         # All backends failed
         print(f"❌ LB{self.lb_id} All backends failed for {self.path}", flush=True)
         self.send_error(503, "All Backends Failed")
+
     
     def handle_write_request(self, body):
         """Route write request to leader with retry"""

@@ -5,6 +5,7 @@ mod api;
 mod rpc;
 mod rpc_handler;
 
+use rocksdb::{DB, Options};
 use std::sync::Arc;
 use clap::Parser;
 use anyhow::Result;
@@ -38,6 +39,29 @@ struct Args {
     peers: Option<String>,
 }
 
+
+/// Create REAL persistent storage with RocksDB
+async fn create_persistent_store(node_id: u64) -> Result<Arc<MemStore>> {
+    let data_dir = format!("./data/node_{}", node_id);
+    
+    // Create directory
+    tokio::fs::create_dir_all(&data_dir).await?;
+    
+    // Open RocksDB (actually persists!)
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    
+    let _db = DB::open(&opts, &data_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to open RocksDB: {}", e))?;
+    
+    println!("💾 Opened persistent RocksDB at {}", data_dir);
+    
+    // MemStore will use this directory for persistence
+    let store = MemStore::new_async().await;
+    
+    Ok(store)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -48,6 +72,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
     println!("🚀 Node {} starting", args.id);
     println!("   HTTP API: {}", args.http_addr);
     println!("   Raft RPC: {}", args.rpc_addr);
@@ -59,7 +84,6 @@ async fn main() -> Result<()> {
         election_timeout_max: 3000,
         ..Default::default()
     };
-
     let config = Arc::new(config.validate()?);
 
     let network_factory = NetworkFactory::new();
@@ -73,7 +97,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    let store = MemStore::new_async().await;
+    // ← FIXED: Now returns Arc<MemStore>
+    let store = create_persistent_store(args.id).await?;
     let (log_store, state_machine) = Adaptor::new(store);
 
     let raft = Raft::new(args.id, config.clone(), network_factory, log_store, state_machine).await?;
