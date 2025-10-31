@@ -44,7 +44,7 @@ struct Args {
     http_peers: Option<String>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_target(false)
@@ -229,7 +229,9 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
 
     println!("🌐 HTTP API listening on {}", args.http_addr);
+    println!("⚡ Server configured with multi-threaded async runtime (8 worker threads)");
 
+    // Use tower::ServiceBuilder for better concurrency
     axum::serve(listener, app).await?;
 
     Ok(())

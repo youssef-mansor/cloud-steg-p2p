@@ -400,22 +400,33 @@ async fn steg_image(
         println!("📥 Node {} (follower) processing forwarded steg request: {} bytes", state.node_id, image_size);
         println!("🔐 Starting steganography embedding...");
         println!("🔒 Encrypting and embedding image...");
-        match embed_image_into_cover(&body[..]) {
-            Ok(stego_bytes) => {
+        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
+        let body_clone = body.clone();
+        let node_id = state.node_id;
+        match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
+            Ok(Ok(stego_bytes)) => {
                 println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
-                         state.node_id, stego_bytes.len(), image_size);
+                         node_id, stego_bytes.len(), image_size);
                 return (
                     StatusCode::OK,
                     [("Content-Type", "image/png")],
                     axum::body::Bytes::from(stego_bytes),
                 ).into_response();
             }
-            Err(e) => {
-                eprintln!("❌ Node {} failed to embed image: {}", state.node_id, e);
+            Ok(Err(e)) => {
+                eprintln!("❌ Node {} failed to embed image: {}", node_id, e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [("Content-Type", "application/json")],
                     format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                ).into_response();
+            }
+            Err(e) => {
+                eprintln!("❌ Node {} task join error: {}", node_id, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Task execution failed"}}"#),
                 ).into_response();
             }
         }
@@ -435,23 +446,34 @@ async fn steg_image(
         println!("📥 Node {} (leader) processing steg request locally: {} bytes", state.node_id, image_size);
         println!("🔐 Starting steganography embedding...");
         println!("🔒 Encrypting and embedding image...");
-        match embed_image_into_cover(&body[..]) {
-            Ok(stego_bytes) => {
+        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
+        let body_clone = body.clone();
+        let node_id = state.node_id;
+        match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
+            Ok(Ok(stego_bytes)) => {
                 println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
-                         state.node_id, stego_bytes.len(), image_size);
+                         node_id, stego_bytes.len(), image_size);
                 (
                     StatusCode::OK,
                     [("Content-Type", "image/png")],
                     axum::body::Bytes::from(stego_bytes),
                 ).into_response()
             }
-            Err(e) => {
-                eprintln!("❌ Node {} failed to embed image: {}", state.node_id, e);
+            Ok(Err(e)) => {
+                eprintln!("❌ Node {} failed to embed image: {}", node_id, e);
                 eprintln!("   Error details: {:?}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [("Content-Type", "application/json")],
                     format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                ).into_response()
+            }
+            Err(e) => {
+                eprintln!("❌ Node {} task join error: {}", node_id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Task execution failed"}}"#),
                 ).into_response()
             }
         }
