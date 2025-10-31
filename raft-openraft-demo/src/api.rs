@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{State, Path},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -24,7 +24,6 @@ pub struct AppState {
 /// Request to initialize the cluster
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InitRequest {
-    /// Optional: specify initial members, otherwise single-node cluster
     pub members: Option<Vec<NodeId>>,
 }
 
@@ -35,7 +34,7 @@ pub struct AddLearnerRequest {
     pub address: String,
 }
 
-/// Request to change membership (promote learners to voters)
+/// Request to change membership
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChangeMembershipRequest {
     pub members: Vec<NodeId>,
@@ -57,6 +56,7 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/cluster/init", post(init_cluster))
         .route("/cluster/add-learner", post(add_learner))
         .route("/cluster/change-membership", post(change_membership))
+        .route("/image/echo", post(echo_image))  // Add echo endpoint
         .with_state(app_state)
 }
 
@@ -69,7 +69,8 @@ async fn root(State(state): State<AppState>) -> impl IntoResponse {
             "metrics": "/metrics",
             "init": "POST /cluster/init",
             "add_learner": "POST /cluster/add-learner",
-            "change_membership": "POST /cluster/change-membership"
+            "change_membership": "POST /cluster/change-membership",
+            "image_echo": "POST /image/echo"
         }
     }))
 }
@@ -93,14 +94,13 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Initialize cluster - makes this node the leader of a single-node cluster
+/// Initialize cluster
 async fn init_cluster(
     State(state): State<AppState>,
-    Json(_req): Json<InitRequest>,  // Changed req to _req
+    Json(_req): Json<InitRequest>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
     println!("🎬 Initializing cluster...");
     
-    // Create a single-node cluster with just this node
     let mut nodes = BTreeMap::new();
     nodes.insert(state.node_id, ());
     
@@ -116,8 +116,7 @@ async fn init_cluster(
     }))
 }
 
-
-/// Add a learner node (non-voting member)
+/// Add a learner node
 async fn add_learner(
     State(state): State<AppState>,
     Json(req): Json<AddLearnerRequest>,
@@ -136,15 +135,13 @@ async fn add_learner(
     }))
 }
 
-/// Change membership - promote learners to voters
-/// Change membership - promote learners to voters
+/// Change membership
 async fn change_membership(
     State(state): State<AppState>,
     Json(req): Json<ChangeMembershipRequest>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
     println!("🔄 Changing membership to: {:?}", req.members);
     
-    // change_membership expects a list of node IDs
     state.raft.change_membership(req.members.clone(), true).await
         .map_err(|e| AppError(format!("Failed to change membership: {}", e)))?;
     
@@ -157,8 +154,24 @@ async fn change_membership(
     }))
 }
 
+/// Echo image - receive and return immediately (no storage)
+async fn echo_image(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let image_size = body.len();
+    println!("📥 Node {} received image: {} bytes", state.node_id, image_size);
+    println!("📤 Echoing back {} bytes", image_size);
+    
+    // Just return the same bytes back
+    (
+        StatusCode::OK,
+        [("Content-Type", "application/octet-stream")],
+        body.to_vec(),
+    )
+}
 
-/// Error wrapper for HTTP responses
+/// Error wrapper
 struct AppError(String);
 
 impl IntoResponse for AppError {
