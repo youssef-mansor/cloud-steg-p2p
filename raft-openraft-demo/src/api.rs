@@ -1,18 +1,19 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chacha20poly1305::{aead::Aead, aead::KeyInit, ChaCha20Poly1305, Key, Nonce};
-use openraft::{Raft, RaftMetrics};
+use openraft::{Raft, RaftMetrics, ServerState};
 use openraft_memstore::TypeConfig;
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::{random, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub type NodeId = u64;
 pub type RaftNode = Raft<TypeConfig>;
@@ -22,6 +23,9 @@ pub type RaftNode = Raft<TypeConfig>;
 pub struct AppState {
     pub raft: Arc<RaftNode>,
     pub node_id: NodeId,
+    pub http_addresses: Arc<RwLock<BTreeMap<NodeId, String>>>,
+    pub self_http_addr: String,
+    pub healthy_nodes: Arc<RwLock<BTreeMap<NodeId, bool>>>, // Track which nodes are healthy
 }
 
 /// Request to initialize the cluster
@@ -159,35 +163,214 @@ async fn change_membership(
     }))
 }
 
+/// Forward HTTP request to another node
+async fn forward_request_to_node(
+    node_id: NodeId,
+    http_addr: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<reqwest::Response, String> {
+    let url = format!("http://{}{}", http_addr, path);
+    // Create client with timeout to avoid hanging on crashed nodes
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    
+    client
+        .post(&url)
+        .header("X-Raft-Forwarded", "true")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| format!("Failed to forward to node {} at {}: {}", node_id, http_addr, e))
+}
+
+/// Get a random node ID from available nodes (including self)
+/// Prefers healthy nodes, but gives unhealthy nodes a 10% chance for recovery
+async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
+    let http_addrs = state.http_addresses.read().await;
+    let healthy = state.healthy_nodes.read().await;
+    
+    if http_addrs.is_empty() {
+        // Fallback to self (self is always considered healthy)
+        return Some((state.node_id, state.self_http_addr.clone()));
+    }
+    
+    // Separate healthy and unhealthy nodes
+    let mut healthy_node_ids: Vec<_> = Vec::new();
+    let mut unhealthy_node_ids: Vec<_> = Vec::new();
+    
+    for (id, _) in http_addrs.iter() {
+        if *id == state.node_id {
+            // Self is always healthy
+            healthy_node_ids.push(*id);
+        } else if healthy.get(id).copied().unwrap_or(false) {
+            healthy_node_ids.push(*id);
+        } else {
+            unhealthy_node_ids.push(*id);
+        }
+    }
+    
+    // If we have healthy nodes and random check (20% chance), give unhealthy nodes a chance
+    // This allows crashed nodes to prove they've recovered
+    let use_unhealthy = !healthy_node_ids.is_empty() && 
+                        !unhealthy_node_ids.is_empty() && 
+                        (random::<usize>() % 5) == 0; // 20% chance (1 in 5)
+    
+    if use_unhealthy && !unhealthy_node_ids.is_empty() {
+        // Give an unhealthy node a chance to prove it's back
+        let idx = random::<usize>() % unhealthy_node_ids.len();
+        let selected_id = unhealthy_node_ids[idx];
+        let addr = http_addrs.get(&selected_id)?.clone();
+        println!("🔍 Probation: trying unhealthy node {} to check if it recovered", selected_id);
+        return Some((selected_id, addr));
+    }
+    
+    // Normal case: select from healthy nodes
+    if healthy_node_ids.is_empty() {
+        // No healthy nodes, try unhealthy ones
+        if unhealthy_node_ids.is_empty() {
+            return Some((state.node_id, state.self_http_addr.clone()));
+        }
+        let idx = random::<usize>() % unhealthy_node_ids.len();
+        let selected_id = unhealthy_node_ids[idx];
+        let addr = http_addrs.get(&selected_id)?.clone();
+        return Some((selected_id, addr));
+    }
+    
+    let idx = random::<usize>() % healthy_node_ids.len();
+    let selected_id = healthy_node_ids[idx];
+    let addr = http_addrs.get(&selected_id)?.clone();
+    
+    Some((selected_id, addr))
+}
+
 /// Echo image - receive and return immediately (no processing)
+/// Load balancing: Followers reject direct requests, Leader forwards randomly
 async fn echo_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let image_size = body.len();
-    println!("📥 Node {} received image for echo: {} bytes", state.node_id, image_size);
-    println!("📤 Echoing back {} bytes", image_size);
     
-    // Just return the same bytes back (original behavior)
-    (
-        StatusCode::OK,
-        [("Content-Type", "application/octet-stream")],
-        body,
-    )
+    // Check if this is a forwarded request from the leader
+    let is_forwarded = headers.contains_key("x-raft-forwarded");
+    
+    // Check if we're the leader
+    let metrics = state.raft.metrics().borrow().clone();
+    let is_leader = matches!(metrics.state, ServerState::Leader);
+    
+    // Followers only accept forwarded requests, not direct client requests
+    if !is_leader && !is_forwarded {
+        println!("🚫 Node {} (follower) dropping direct echo request - only leader processes direct requests", state.node_id);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
+        ).into_response();
+    }
+    
+    // If forwarded request and we're a follower, process it
+    if !is_leader && is_forwarded {
+        println!("📥 Node {} (follower) processing forwarded echo request: {} bytes", state.node_id, image_size);
+        println!("📤 Echoing back {} bytes", image_size);
+        return (
+            StatusCode::OK,
+            [
+                ("Content-Type", "application/octet-stream"),
+                ("X-Processed-By-Node", &format!("{}", state.node_id)),
+            ],
+            body,
+        ).into_response();
+    }
+    
+    // Leader: randomly assign to a node (including self)
+    let (target_id, target_addr) = match get_random_node(&state).await {
+        Some(addr) => addr,
+        None => {
+            println!("⚠️  No available nodes for forwarding, processing locally");
+            (state.node_id, state.self_http_addr.clone())
+        }
+    };
+    
+    if target_id == state.node_id {
+        // Process locally
+        println!("📥 Node {} (leader) processing echo request locally: {} bytes", state.node_id, image_size);
+        println!("📤 Echoing back {} bytes", image_size);
+        (
+            StatusCode::OK,
+            [
+                ("Content-Type", "application/octet-stream"),
+                ("X-Processed-By-Node", &format!("{}", state.node_id)),
+            ],
+            body,
+        ).into_response()
+    } else {
+        // Forward to selected node with retry logic
+        println!("🔄 Node {} (leader) forwarding echo request to node {} at {}", 
+                state.node_id, target_id, target_addr);
+        match forward_request_to_node(target_id, &target_addr, "/image/echo", &body).await {
+            Ok(response) => {
+                match response.bytes().await {
+                    Ok(bytes) => {
+                        println!("✅ Received response from node {}: {} bytes", target_id, bytes.len());
+                        // Mark node as healthy on successful response
+                        let mut healthy = state.healthy_nodes.write().await;
+                        healthy.insert(target_id, true);
+                        drop(healthy);
+                        
+                        let mut headers = HeaderMap::new();
+                        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                        headers.insert("X-Processed-By-Node", format!("{}", target_id).parse().unwrap());
+                        (StatusCode::OK, headers, bytes).into_response()
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to read response from node {}: {}", target_id, e);
+                        // Mark node as unhealthy
+                        let mut healthy = state.healthy_nodes.write().await;
+                        healthy.insert(target_id, false);
+                        drop(healthy);
+                        
+                        // Return error - client should retry
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            [("Content-Type", "application/json")],
+                            format!(r#"{{"error": "Failed to read response from node {}"}}"#, target_id),
+                        ).into_response()
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to forward to node {}: {} - marking as unhealthy", target_id, e);
+                // Mark node as unhealthy when forwarding fails
+                let mut healthy = state.healthy_nodes.write().await;
+                healthy.insert(target_id, false);
+                drop(healthy);
+                
+                // Return error - client should retry (multicast again)
+                (
+                    StatusCode::BAD_GATEWAY,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to forward to node {}: {}"}}"#, target_id, e),
+                ).into_response()
+            }
+        }
+    }
 }
 
 /// Embed image - receive image and return stego image with secret embedded
+/// Load balancing: Followers reject direct requests, Leader forwards randomly
 async fn steg_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let image_size = body.len();
-    println!("📥 Node {} received image for steganography: {} bytes", state.node_id, image_size);
-    println!("🔐 Starting steganography embedding...");
     
     // Check if image is too large (max 1MB for safety)
     if image_size > 1_048_576 {
-        println!("❌ Image too large: {} bytes", image_size);
         return (
             StatusCode::BAD_REQUEST,
             [("Content-Type", "application/json")],
@@ -195,26 +378,133 @@ async fn steg_image(
         ).into_response();
     }
     
-    // Embed the secret image into a cover using steganography
-    println!("🔒 Encrypting and embedding image...");
-    match embed_image_into_cover(&body[..]) {
-        Ok(stego_bytes) => {
-            println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
-                     state.node_id, stego_bytes.len(), image_size);
-            (
-                StatusCode::OK,
-                [("Content-Type", "image/png")],
-                axum::body::Bytes::from(stego_bytes),
-            ).into_response()
+    // Check if this is a forwarded request from the leader
+    let is_forwarded = headers.contains_key("x-raft-forwarded");
+    
+    // Check if we're the leader
+    let metrics = state.raft.metrics().borrow().clone();
+    let is_leader = matches!(metrics.state, ServerState::Leader);
+    
+    // Followers only accept forwarded requests, not direct client requests
+    if !is_leader && !is_forwarded {
+        println!("🚫 Node {} (follower) dropping direct steg request - only leader processes direct requests", state.node_id);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
+        ).into_response();
+    }
+    
+    // If forwarded request and we're a follower, process it
+    if !is_leader && is_forwarded {
+        println!("📥 Node {} (follower) processing forwarded steg request: {} bytes", state.node_id, image_size);
+        println!("🔐 Starting steganography embedding...");
+        println!("🔒 Encrypting and embedding image...");
+        match embed_image_into_cover(&body[..]) {
+            Ok(stego_bytes) => {
+                println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
+                         state.node_id, stego_bytes.len(), image_size);
+                return (
+                    StatusCode::OK,
+                    [("Content-Type", "image/png")],
+                    axum::body::Bytes::from(stego_bytes),
+                ).into_response();
+            }
+            Err(e) => {
+                eprintln!("❌ Node {} failed to embed image: {}", state.node_id, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                ).into_response();
+            }
         }
-        Err(e) => {
-            eprintln!("❌ Node {} failed to embed image: {}", state.node_id, e);
-            eprintln!("   Error details: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Content-Type", "application/json")],
-                format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
-            ).into_response()
+    }
+    
+    // Leader: randomly assign to a node (including self)
+    let (target_id, target_addr) = match get_random_node(&state).await {
+        Some(addr) => addr,
+        None => {
+            println!("⚠️  No available nodes for forwarding, processing locally");
+            (state.node_id, state.self_http_addr.clone())
+        }
+    };
+    
+    if target_id == state.node_id {
+        // Process locally
+        println!("📥 Node {} (leader) processing steg request locally: {} bytes", state.node_id, image_size);
+        println!("🔐 Starting steganography embedding...");
+        println!("🔒 Encrypting and embedding image...");
+        match embed_image_into_cover(&body[..]) {
+            Ok(stego_bytes) => {
+                println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
+                         state.node_id, stego_bytes.len(), image_size);
+                (
+                    StatusCode::OK,
+                    [("Content-Type", "image/png")],
+                    axum::body::Bytes::from(stego_bytes),
+                ).into_response()
+            }
+            Err(e) => {
+                eprintln!("❌ Node {} failed to embed image: {}", state.node_id, e);
+                eprintln!("   Error details: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                ).into_response()
+            }
+        }
+    } else {
+        // Forward to selected node with retry logic
+        println!("🔄 Node {} (leader) forwarding steg request to node {} at {}", 
+                state.node_id, target_id, target_addr);
+        match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
+            Ok(response) => {
+                match response.bytes().await {
+                    Ok(bytes) => {
+                        println!("✅ Received stego image from node {}: {} bytes", target_id, bytes.len());
+                        // Mark node as healthy on successful response
+                        let mut healthy = state.healthy_nodes.write().await;
+                        healthy.insert(target_id, true);
+                        drop(healthy);
+                        
+                        (
+                            StatusCode::OK,
+                            [("Content-Type", "image/png")],
+                            bytes,
+                        ).into_response()
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to read response from node {}: {}", target_id, e);
+                        // Mark node as unhealthy
+                        let mut healthy = state.healthy_nodes.write().await;
+                        healthy.insert(target_id, false);
+                        drop(healthy);
+                        
+                        // Return error - client should retry
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            [("Content-Type", "application/json")],
+                            format!(r#"{{"error": "Failed to read response from node {}"}}"#, target_id),
+                        ).into_response()
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to forward to node {}: {} - marking as unhealthy", target_id, e);
+                // Mark node as unhealthy when forwarding fails
+                let mut healthy = state.healthy_nodes.write().await;
+                healthy.insert(target_id, false);
+                drop(healthy);
+                
+                // Return error - client should retry (multicast again)
+                (
+                    StatusCode::BAD_GATEWAY,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to forward to node {}: {}"}}"#, target_id, e),
+                ).into_response()
+            }
         }
     }
 }

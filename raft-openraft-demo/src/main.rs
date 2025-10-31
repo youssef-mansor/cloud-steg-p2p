@@ -5,6 +5,7 @@ mod api;
 mod rpc;
 mod rpc_handler;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use clap::Parser;
 use anyhow::Result;
@@ -36,6 +37,11 @@ struct Args {
     /// Comma-separated peer addresses, e.g. "2=127.0.0.1:7002,3=127.0.0.1:7003"
     #[clap(long)]
     peers: Option<String>,
+    
+    /// Comma-separated HTTP addresses for peers, e.g. "2=127.0.0.1:8002,3=127.0.0.1:8003"
+    /// If not provided, will try to derive from peers (assumes HTTP port = RPC port + 1000)
+    #[clap(long = "http-peers")]
+    http_peers: Option<String>,
 }
 
 #[tokio::main]
@@ -161,10 +167,62 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Build HTTP addresses map for load balancing
+    let mut http_addresses = std::collections::BTreeMap::new();
+    
+    // Parse HTTP peers if provided, otherwise derive from RPC peers  
+    if let Some(http_peers_str) = &args.http_peers {
+        for peer in http_peers_str.split(',') {
+            if let Some((id_str, addr)) = peer.split_once('=') {
+                let peer_id: NodeId = id_str.trim().parse()?;
+                http_addresses.insert(peer_id, addr.trim().to_string());
+            }
+        }
+    } else if let Some(peers_str) = &args.peers {
+        // Derive HTTP addresses from RPC addresses (assume HTTP = RPC port + 1000)
+        for peer in peers_str.split(',') {
+            if let Some((id_str, rpc_addr)) = peer.split_once('=') {
+                let peer_id: NodeId = id_str.trim().parse()?;
+                let rpc_addr = rpc_addr.trim();
+                // Try to extract port and add 1000
+                if let Some((host, port_str)) = rpc_addr.rsplit_once(':') {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        let http_port = port + 1000;
+                        let http_addr = format!("{}:{}", host, http_port);
+                        http_addresses.insert(peer_id, http_addr);
+                        println!("📋 Derived HTTP address for node {}: {}", peer_id, http_addresses[&peer_id]);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Also add self HTTP address
+    let self_http_addr = if args.http_addr.contains(':') {
+        args.http_addr.clone()
+    } else {
+        format!("127.0.0.1:{}", args.http_addr)
+    };
+    // Normalize address format (remove 0.0.0.0, use 127.0.0.1 for local)
+    let normalized_self_http = self_http_addr.replace("0.0.0.0", "127.0.0.1");
+    http_addresses.insert(args.id, normalized_self_http.clone());
+    
+    println!("📋 HTTP addresses registered: {:?}", http_addresses);
+
+    // Initialize healthy nodes - all nodes start as healthy
+    let mut healthy_nodes = BTreeMap::new();
+    for node_id in http_addresses.keys() {
+        healthy_nodes.insert(*node_id, true);
+    }
+    healthy_nodes.insert(args.id, true); // Self is always healthy
+
     // Start HTTP server
     let app_state = AppState {
         raft: raft.clone(),
         node_id: args.id,
+        http_addresses: Arc::new(tokio::sync::RwLock::new(http_addresses)),
+        self_http_addr: normalized_self_http,
+        healthy_nodes: Arc::new(tokio::sync::RwLock::new(healthy_nodes)),
     };
 
     let app = api::create_router(app_state);
