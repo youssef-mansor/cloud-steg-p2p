@@ -409,7 +409,10 @@ async fn steg_image(
                          node_id, stego_bytes.len(), image_size);
                 return (
                     StatusCode::OK,
-                    [("Content-Type", "image/png")],
+                    [
+                        ("Content-Type", "image/png"),
+                        ("X-Processed-By-Node", &format!("{}", node_id)),
+                    ],
                     axum::body::Bytes::from(stego_bytes),
                 ).into_response();
             }
@@ -455,7 +458,10 @@ async fn steg_image(
                          node_id, stego_bytes.len(), image_size);
                 (
                     StatusCode::OK,
-                    [("Content-Type", "image/png")],
+                    [
+                        ("Content-Type", "image/png"),
+                        ("X-Processed-By-Node", &format!("{}", node_id)),
+                    ],
                     axum::body::Bytes::from(stego_bytes),
                 ).into_response()
             }
@@ -491,11 +497,10 @@ async fn steg_image(
                         healthy.insert(target_id, true);
                         drop(healthy);
                         
-                        (
-                            StatusCode::OK,
-                            [("Content-Type", "image/png")],
-                            bytes,
-                        ).into_response()
+                        let mut headers = HeaderMap::new();
+                        headers.insert("Content-Type", "image/png".parse().unwrap());
+                        headers.insert("X-Processed-By-Node", format!("{}", target_id).parse().unwrap());
+                        (StatusCode::OK, headers, bytes).into_response()
                     }
                     Err(e) => {
                         eprintln!("❌ Failed to read response from node {}: {}", target_id, e);
