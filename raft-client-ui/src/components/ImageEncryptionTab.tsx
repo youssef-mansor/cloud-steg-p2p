@@ -184,11 +184,6 @@ export function ImageEncryptionTab() {
 
           completedRequests++;
           setStressTestProgress(completedRequests);
-          
-          // Update display every 5 requests to avoid excessive re-renders
-          if (completedRequests % 5 === 0) {
-            updateStatsDisplay();
-          }
         }
       })();
 
@@ -197,7 +192,7 @@ export function ImageEncryptionTab() {
 
     await Promise.all(threads);
 
-    // Final stats update
+    // Final stats update and graphs - ONLY shown at the end
     updateStatsDisplay();
 
     // Calculate time-series data for throughput graph ONLY at the end (faster!)
