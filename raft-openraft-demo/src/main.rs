@@ -223,15 +223,16 @@ async fn main() -> Result<()> {
         http_addresses: Arc::new(tokio::sync::RwLock::new(http_addresses)),
         self_http_addr: normalized_self_http,
         healthy_nodes: Arc::new(tokio::sync::RwLock::new(healthy_nodes)),
+        node_latencies: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
     };
 
     let app = api::create_router(app_state);
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
 
     println!("🌐 HTTP API listening on {}", args.http_addr);
+    println!("🌍 CORS enabled - allowing cross-origin requests from any origin");
     println!("⚡ Server configured with multi-threaded async runtime (8 worker threads)");
 
-    // Use tower::ServiceBuilder for better concurrency
     axum::serve(listener, app).await?;
 
     Ok(())

@@ -216,7 +216,103 @@ Client Request → Axum Router → Handler (async)
 - Only healthy nodes selected for load balancing
 - Probation mechanism (20% chance) gives unhealthy nodes recovery opportunity
 
+### Latency-Aware Load Balancing
+
+**Strategy:**
+- Leader tracks response latency (milliseconds) for each node
+- Uses **inverse latency weighting** to prefer faster nodes
+- Faster nodes naturally receive more load
+- Enables automatic adaptation to cluster performance variations
+
+**Implementation:**
+
+```rust
+// Track latency statistics per node
+pub struct LatencyStats {
+    pub total_ms: u64,   // Cumulative latency
+    pub count: u64,      // Number of samples
+}
+
+impl LatencyStats {
+    pub fn average_ms(&self) -> f64 {
+        if self.count == 0 { 0.0 } else { self.total_ms as f64 / self.count as f64 }
+    }
+}
+
+// Load balancing with latency weighting
+async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
+    let latencies = state.node_latencies.read().await;
+    
+    // Calculate weighted selection based on inverse latency
+    let mut weighted_nodes: Vec<(NodeId, f64)> = Vec::new();
+    let mut total_weight: f64 = 0.0;
+    
+    for node_id in &healthy_non_self_nodes {
+        let latency_ms = latencies
+            .get(node_id)
+            .map(|s| s.average_ms())
+            .unwrap_or(50.0);  // Default 50ms if no data
+        
+        // Weight = 1 / latency, so faster nodes get higher weight
+        let weight = 1.0 / (latency_ms + 1.0);
+        weighted_nodes.push((*node_id, weight));
+        total_weight += weight;
+    }
+    
+    // Select node based on weighted probability
+    let mut rand_val = (random::<f64>()) * total_weight;
+    for (node_id, weight) in weighted_nodes {
+        rand_val -= weight;
+        if rand_val <= 0.0 {
+            println!("🎯 LATENCY-WEIGHTED: Selected node {} (avg latency: {:.1}ms)", 
+                     node_id, latencies.get(&node_id)?.average_ms());
+            return Some((node_id, http_addrs.get(&node_id)?.clone()));
+        }
+    }
+    
+    Some((node_id, addr))
+}
+
+// Record latency on each request
+let start_time = std::time::Instant::now();
+match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
+    Ok(response) => {
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        
+        // Update latency statistics
+        let mut latencies = state.node_latencies.write().await;
+        let stats = latencies.entry(target_id).or_insert(LatencyStats {
+            total_ms: 0,
+            count: 0,
+        });
+        stats.total_ms += elapsed_ms;
+        stats.count += 1;
+    }
+}
+```
+
+**Example Behavior:**
+
+With 3 nodes and these latencies:
+- Node 1: 50ms → weight = 1/51 ≈ 0.020
+- Node 2: 100ms → weight = 1/101 ≈ 0.010  
+- Node 3: 200ms → weight = 1/201 ≈ 0.005
+
+**Selection probability:**
+- Node 1 (fast): 51% of requests
+- Node 2 (medium): 25% of requests
+- Node 3 (slow): 13% of requests
+- (Remaining 11% to leader for local processing)
+
+**Benefits:**
+- ✅ Automatic performance adaptation
+- ✅ Faster nodes handle more load naturally
+- ✅ Slow nodes gracefully receive fewer requests
+- ✅ No manual configuration required
+- ✅ Responds dynamically to network changes
+
 ### CPU-Intensive Operations
+
 
 **Steganography Processing:**
 - Image encryption and embedding is CPU-intensive
@@ -456,6 +552,33 @@ python3 test_load_balancing_threaded.py
 | **Total Time (2000 req)** | ~66s | ~9s |
 | **CPU Usage** | *** | **** |
 
+**Throughput Calculation (Per-Node):**
+
+The client calculates throughput for each node based on **actual request timing**, not total test duration:
+
+```typescript
+// Track when each request for a node completes
+const nodeStat.requestTimestamps = [t1, t2, t3, ..., tn];
+
+// Calculate time span from first to last request
+const nodeStartTime = nodeStat.requestTimestamps[0];
+const nodeEndTime = nodeStat.requestTimestamps[nodeStat.requestTimestamps.length - 1];
+const nodeElapsedSeconds = (nodeEndTime - nodeStartTime) / 1000;
+
+// True throughput = successful requests during that time window
+const requestsPerSecond = nodeStat.success / nodeElapsedSeconds;
+```
+
+**Why This Matters:**
+
+❌ **Wrong:** `(total_requests / total_test_time)` - Divides by entire test duration
+- Example: If 39 requests hit Node 1, and total test took 120s → 0.32 req/s ❌
+
+✅ **Correct:** `(node_requests / time_window_for_that_node)` - Divides by actual time window
+- Example: If 39 requests hit Node 1 between 2s-4s → 19.5 req/s ✅
+
+This shows Node 1's *actual processing rate*, not an artificially low number caused by requests arriving at different times.
+
 **Factors Affecting Performance:**
 - Network latency
 - Image size (for steganography endpoint)
@@ -463,6 +586,7 @@ python3 test_load_balancing_threaded.py
 - System resources (CPU, memory, network bandwidth)
 
 ### Configuration Tuning
+
 
 **Client (Python):**
 ```python

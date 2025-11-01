@@ -14,9 +14,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tower_http::cors::{CorsLayer, Any};
 
 pub type NodeId = u64;
 pub type RaftNode = Raft<TypeConfig>;
+
+/// Latency statistics for a single node
+#[derive(Clone, Copy, Debug)]
+pub struct LatencyStats {
+    pub total_ms: u64,
+    pub count: u64,
+}
+
+impl LatencyStats {
+    pub fn average_ms(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.total_ms as f64 / self.count as f64
+        }
+    }
+}
 
 /// Application state shared across HTTP handlers
 #[derive(Clone)]
@@ -26,6 +44,7 @@ pub struct AppState {
     pub http_addresses: Arc<RwLock<BTreeMap<NodeId, String>>>,
     pub self_http_addr: String,
     pub healthy_nodes: Arc<RwLock<BTreeMap<NodeId, bool>>>, // Track which nodes are healthy
+    pub node_latencies: Arc<RwLock<BTreeMap<NodeId, LatencyStats>>>, // Track latency per node
 }
 
 /// Request to initialize the cluster
@@ -57,6 +76,13 @@ pub struct ApiResponse<T> {
 
 /// Create the HTTP router
 pub fn create_router(app_state: AppState) -> Router {
+    // Configure CORS to allow cross-origin requests from web UI
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers(Any);  // CRITICAL: Expose custom headers like X-Processed-By-Node to browser
+    
     Router::new()
         .route("/", get(root))
         .route("/metrics", get(metrics))
@@ -65,6 +91,7 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/cluster/change-membership", post(change_membership))
         .route("/image/echo", post(echo_image))      // Echo: return same image
         .route("/image/steg", post(steg_image))      // Steganography: embed and return stego image
+        .layer(cors)
         .with_state(app_state)
 }
 
@@ -186,40 +213,85 @@ async fn forward_request_to_node(
         .map_err(|e| format!("Failed to forward to node {} at {}: {}", node_id, http_addr, e))
 }
 
-/// Get a random node ID from available nodes (including self)
-/// Prefers healthy nodes, but gives unhealthy nodes a 10% chance for recovery
+/// Get a node ID using latency-aware weighted selection
+/// Prefers fast, healthy nodes over slow ones using inverse latency weighting
 async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     let http_addrs = state.http_addresses.read().await;
     let healthy = state.healthy_nodes.read().await;
+    let latencies = state.node_latencies.read().await;
+    
+    println!("🔍 get_random_node CALLED: http_addrs has {} nodes, healthy has {} nodes", 
+             http_addrs.len(), healthy.len());
     
     if http_addrs.is_empty() {
-        // Fallback to self (self is always considered healthy)
+        println!("⚠️  CRITICAL: http_addrs is EMPTY! Falling back to self (Node {})", state.node_id);
         return Some((state.node_id, state.self_http_addr.clone()));
     }
     
-    // Separate healthy and unhealthy nodes
+    // Separate healthy and unhealthy nodes, also track non-self nodes for load distribution
     let mut healthy_node_ids: Vec<_> = Vec::new();
+    let mut healthy_non_self_nodes: Vec<_> = Vec::new();
     let mut unhealthy_node_ids: Vec<_> = Vec::new();
     
     for (id, _) in http_addrs.iter() {
         if *id == state.node_id {
-            // Self is always healthy
             healthy_node_ids.push(*id);
         } else if healthy.get(id).copied().unwrap_or(false) {
             healthy_node_ids.push(*id);
+            healthy_non_self_nodes.push(*id);
         } else {
             unhealthy_node_ids.push(*id);
         }
     }
     
+    println!("📊 Load balance analysis: self={}, non_self_healthy={}, unhealthy={}", 
+             state.node_id, healthy_non_self_nodes.len(), unhealthy_node_ids.len());
+    
+    // STRATEGY: Latency-aware weighted selection for better load distribution
+    // Faster nodes get higher selection probability (inverse latency weighting)
+    if !healthy_non_self_nodes.is_empty() {
+        let forward_preference = (random::<usize>() % 100) < 80; // 80% preference to forward
+        if forward_preference {
+            // Calculate weighted selection based on inverse latency
+            let mut weighted_nodes: Vec<(NodeId, f64)> = Vec::new();
+            let mut total_weight: f64 = 0.0;
+            
+            for node_id in &healthy_non_self_nodes {
+                let latency_ms = latencies
+                    .get(node_id)
+                    .map(|s| s.average_ms())
+                    .unwrap_or(50.0); // Default 50ms if no data
+                
+                // Weight = 1 / latency, so faster nodes get higher weight
+                // Add small offset to avoid division issues with very low latencies
+                let weight = 1.0 / (latency_ms + 1.0);
+                weighted_nodes.push((*node_id, weight));
+                total_weight += weight;
+            }
+            
+            // Select node based on weighted probability
+            let mut rand_val = (random::<f64>()) * total_weight;
+            for (node_id, weight) in weighted_nodes {
+                rand_val -= weight;
+                if rand_val <= 0.0 {
+                    let addr = http_addrs.get(&node_id)?.clone();
+                    let avg_latency = latencies
+                        .get(&node_id)
+                        .map(|s| format!("{:.1}ms", s.average_ms()))
+                        .unwrap_or("N/A".to_string());
+                    println!("🎯 LATENCY-WEIGHTED: Selected node {} (avg latency: {})", node_id, avg_latency);
+                    return Some((node_id, addr));
+                }
+            }
+        }
+    }
+    
     // If we have healthy nodes and random check (20% chance), give unhealthy nodes a chance
-    // This allows crashed nodes to prove they've recovered
     let use_unhealthy = !healthy_node_ids.is_empty() && 
                         !unhealthy_node_ids.is_empty() && 
-                        (random::<usize>() % 5) == 0; // 20% chance (1 in 5)
+                        (random::<usize>() % 5) == 0;
     
     if use_unhealthy && !unhealthy_node_ids.is_empty() {
-        // Give an unhealthy node a chance to prove it's back
         let idx = random::<usize>() % unhealthy_node_ids.len();
         let selected_id = unhealthy_node_ids[idx];
         let addr = http_addrs.get(&selected_id)?.clone();
@@ -229,8 +301,8 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     
     // Normal case: select from healthy nodes
     if healthy_node_ids.is_empty() {
-        // No healthy nodes, try unhealthy ones
         if unhealthy_node_ids.is_empty() {
+            println!("⚠️  No nodes available, processing locally");
             return Some((state.node_id, state.self_http_addr.clone()));
         }
         let idx = random::<usize>() % unhealthy_node_ids.len();
@@ -242,6 +314,8 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     let idx = random::<usize>() % healthy_node_ids.len();
     let selected_id = healthy_node_ids[idx];
     let addr = http_addrs.get(&selected_id)?.clone();
+    
+    println!("✅ get_random_node selected node {} from {} healthy nodes", selected_id, healthy_node_ids.len());
     
     Some((selected_id, addr))
 }
@@ -369,21 +443,22 @@ async fn steg_image(
 ) -> impl IntoResponse {
     let image_size = body.len();
     
-    // Check if image is too large (max 1MB for safety)
-    if image_size > 1_048_576 {
+    // Check Raft state first
+    let metrics = state.raft.metrics().borrow().clone();
+    let is_leader = matches!(metrics.state, ServerState::Leader);
+    let is_forwarded = headers.contains_key("x-raft-forwarded");
+    
+    println!("📨 steg_image: Node {} (is_leader={}, is_forwarded={}) received {} bytes", 
+             state.node_id, is_leader, is_forwarded, image_size);
+    
+    // Check if image is too large (max 10MB for safety)
+    if image_size > 10_485_760 {
         return (
             StatusCode::BAD_REQUEST,
             [("Content-Type", "application/json")],
-            format!(r#"{{"error": "Image too large (max 1MB), received {} bytes"}}"#, image_size),
+            format!(r#"{{"error": "Image too large (max 10MB), received {} bytes"}}"#, image_size),
         ).into_response();
     }
-    
-    // Check if this is a forwarded request from the leader
-    let is_forwarded = headers.contains_key("x-raft-forwarded");
-    
-    // Check if we're the leader
-    let metrics = state.raft.metrics().borrow().clone();
-    let is_leader = matches!(metrics.state, ServerState::Leader);
     
     // Followers only accept forwarded requests, not direct client requests
     if !is_leader && !is_forwarded {
@@ -436,6 +511,7 @@ async fn steg_image(
     }
     
     // Leader: randomly assign to a node (including self)
+    println!("👉 Leader {} calling get_random_node()...", state.node_id);
     let (target_id, target_addr) = match get_random_node(&state).await {
         Some(addr) => addr,
         None => {
@@ -443,6 +519,8 @@ async fn steg_image(
             (state.node_id, state.self_http_addr.clone())
         }
     };
+    
+    println!("🎯 Leader {} selected target node {} at addr {}", state.node_id, target_id, target_addr);
     
     if target_id == state.node_id {
         // Process locally
@@ -484,14 +562,28 @@ async fn steg_image(
             }
         }
     } else {
-        // Forward to selected node with retry logic
+        // Forward to selected node with retry logic and latency tracking
+        let start_time = std::time::Instant::now();
         println!("🔄 Node {} (leader) forwarding steg request to node {} at {}", 
                 state.node_id, target_id, target_addr);
         match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
             Ok(response) => {
                 match response.bytes().await {
                     Ok(bytes) => {
-                        println!("✅ Received stego image from node {}: {} bytes", target_id, bytes.len());
+                        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                        println!("✅ Received stego image from node {}: {} bytes (latency: {}ms)", 
+                                target_id, bytes.len(), elapsed_ms);
+                        
+                        // Record latency for this node
+                        let mut latencies = state.node_latencies.write().await;
+                        let stats = latencies.entry(target_id).or_insert(LatencyStats {
+                            total_ms: 0,
+                            count: 0,
+                        });
+                        stats.total_ms += elapsed_ms;
+                        stats.count += 1;
+                        drop(latencies);
+                        
                         // Mark node as healthy on successful response
                         let mut healthy = state.healthy_nodes.write().await;
                         healthy.insert(target_id, true);
@@ -503,7 +595,19 @@ async fn steg_image(
                         (StatusCode::OK, headers, bytes).into_response()
                     }
                     Err(e) => {
-                        eprintln!("❌ Failed to read response from node {}: {}", target_id, e);
+                        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                        eprintln!("❌ Failed to read response from node {}: {} (latency: {}ms)", target_id, e, elapsed_ms);
+                        
+                        // Record latency (slow failures matter too!)
+                        let mut latencies = state.node_latencies.write().await;
+                        let stats = latencies.entry(target_id).or_insert(LatencyStats {
+                            total_ms: 0,
+                            count: 0,
+                        });
+                        stats.total_ms += elapsed_ms;
+                        stats.count += 1;
+                        drop(latencies);
+                        
                         // Mark node as unhealthy
                         let mut healthy = state.healthy_nodes.write().await;
                         healthy.insert(target_id, false);
@@ -519,7 +623,18 @@ async fn steg_image(
                 }
             }
             Err(e) => {
-                eprintln!("❌ Failed to forward to node {}: {} - marking as unhealthy", target_id, e);
+                let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                eprintln!("❌ Failed to forward to node {}: {} (latency: {}ms) - marking as unhealthy", target_id, e, elapsed_ms);
+                
+                // Record latency even on failure
+                let mut latencies = state.node_latencies.write().await;
+                let stats = latencies.entry(target_id).or_insert(LatencyStats {
+                    total_ms: 0,
+                    count: 0,
+                });
+                stats.total_ms += elapsed_ms;
+                stats.count += 1;
+                drop(latencies);
                 // Mark node as unhealthy when forwarding fails
                 let mut healthy = state.healthy_nodes.write().await;
                 healthy.insert(target_id, false);
