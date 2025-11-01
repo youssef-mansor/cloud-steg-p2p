@@ -61,7 +61,7 @@ export class RaftApiClient {
   async uploadImageForEncryption(
     nodeId: number,
     imageFile: File
-  ): Promise<{ success: boolean; data?: Blob; error?: string; latency: number; processedBy?: number }> {
+  ): Promise<{ success: boolean; data?: Blob; key?: string; error?: string; latency: number; processedBy?: number }> {
     const node = this.nodes.find((n) => n.id === nodeId);
     if (!node) {
       return { success: false, error: `Node ${nodeId} not found`, latency: 0 };
@@ -86,13 +86,31 @@ export class RaftApiClient {
         return { success: false, error: `HTTP ${response.status}`, latency };
       }
 
-      // Read the X-Processed-By-Node header to see which node actually processed it
+      // Parse JSON response with key and base64 image
+      const jsonResponse = await response.json();
+      const { key, image } = jsonResponse;
+
+      if (!key || !image) {
+        console.error(`Node ${nodeId} returned invalid response: missing key or image`);
+        return { success: false, error: 'Invalid response format', latency };
+      }
+
+      // Convert base64 image to Blob
+      const base64String = image.split(',')[1] || image; // Handle data:image/png;base64,... format
+      const byteCharacters = atob(base64String);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], { type: 'image/png' });
+
+      // Read X-Processed-By-Node header to track which node actually processed the request
       const processedByHeader = response.headers.get('X-Processed-By-Node');
       const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : nodeId;
 
-      const blob = await response.blob();
-      console.log(`Node ${nodeId} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${latency.toFixed(0)}ms`);
-      return { success: true, data: blob, latency, processedBy };
+      console.log(`Node ${nodeId} succeeded: processed by node ${processedBy}, encryption key: ${key}, received ${blob.size} bytes, latency: ${latency.toFixed(0)}ms`);
+      return { success: true, data: blob, key, latency, processedBy };
     } catch (error) {
       const latency = performance.now() - startTime;
       console.error(`Node ${nodeId} error:`, error);
@@ -104,6 +122,7 @@ export class RaftApiClient {
   async uploadImageToCluster(imageFile: File): Promise<{
     success: boolean;
     data?: Blob;
+    key?: string;
     error?: string;
     nodeId?: number;
     processedBy?: number;
@@ -124,8 +143,8 @@ export class RaftApiClient {
     };
   }
 
-  // Decrypt/Extract image from stego image
-  async decryptImageFromCluster(stegoFile: File): Promise<{
+  // Decrypt/Extract image from stego image (with multicast to all nodes)
+  async decryptImageFromCluster(stegoFile: File, encryptionKey: string): Promise<{
     success: boolean;
     data?: Blob;
     error?: string;
@@ -133,40 +152,119 @@ export class RaftApiClient {
     processedBy?: number;
     latency: number;
   }> {
-    const node = this.nodes[0];
-    if (!node) {
-      return { success: false, error: 'No nodes available', latency: 0 };
-    }
-
     const startTime = performance.now();
 
     try {
       const arrayBuffer = await stegoFile.arrayBuffer();
-      console.log(`Decrypting stego image (${node.httpAddr}/image/decrypt), file size: ${arrayBuffer.byteLength} bytes`);
       
-      const response = await fetch(`${node.httpAddr}/image/decrypt`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: arrayBuffer,
-      });
+      // Longer timeout for large files (30 seconds instead of default fetch timeout)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
+      // Try each node (multicast pattern like encryption)
+      const results = await Promise.allSettled(
+        this.nodes.map(async (node) => {
+          console.log(`Attempting decryption on node ${node.id} (${node.httpAddr}/image/decrypt?key=${encryptionKey}), file size: ${arrayBuffer.byteLength} bytes`);
+          
+          const nodeStartTime = performance.now();
+          const response = await fetch(
+            `${node.httpAddr}/image/decrypt?key=${encodeURIComponent(encryptionKey)}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: arrayBuffer,
+              signal: controller.signal,
+            }
+          );
 
-      const latency = performance.now() - startTime;
+          const nodeLatency = performance.now() - nodeStartTime;
 
-      if (!response.ok) {
-        console.error(`Decryption failed: HTTP ${response.status}`);
-        return { success: false, error: `HTTP ${response.status}`, latency };
+          if (!response.ok) {
+            console.error(`Node ${node.id} returned HTTP ${response.status}`);
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const processedByHeader = response.headers.get('X-Processed-By-Node');
+          const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : node.id;
+
+          // Get the raw bytes and create a blob with image/png type
+          const arrayBufferResponse = await response.arrayBuffer();
+          const blob = new Blob([arrayBufferResponse], { type: 'image/png' });
+          console.log(`✅ Node ${node.id} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${nodeLatency.toFixed(0)}ms`);
+          
+          return { 
+            success: true, 
+            data: blob, 
+            nodeId: node.id,
+            processedBy, 
+            latency: nodeLatency 
+          };
+        })
+      );
+
+      clearTimeout(timeoutId);
+
+      // Find first successful result
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value.success) {
+          const totalLatency = performance.now() - startTime;
+          return { 
+            success: true, 
+            data: result.value.data, 
+            nodeId: result.value.nodeId,
+            processedBy: result.value.processedBy,
+            latency: totalLatency 
+          };
+        }
       }
 
-      const processedByHeader = response.headers.get('X-Processed-By-Node');
-      const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : node.id;
+      // All failed
+      const totalLatency = performance.now() - startTime;
+      const errors = results
+        .map((r, i) => {
+          if (r.status === 'rejected') {
+            const errorMsg = r.reason?.message || String(r.reason);
+            // Provide helpful error interpretation
+            let friendlyError = errorMsg;
+            if (errorMsg.includes('ERR_CONNECTION_ABORTED') || errorMsg.includes('signal')) {
+              friendlyError = 'Request timeout (took too long to process)';
+            } else if (errorMsg.includes('ERR_CONNECTION_RESET')) {
+              friendlyError = 'Server connection reset (server may have crashed)';
+            } else if (errorMsg.includes('Failed to fetch')) {
+              friendlyError = 'Network error or server not responding';
+            }
+            return `Node ${this.nodes[i].id}: ${friendlyError}`;
+          } else if (r.status === 'fulfilled' && !r.value.success) {
+            return `Node ${this.nodes[i].id}: Failed`;
+          }
+          return null;
+        })
+        .filter((e) => e !== null)
+        .join('; ');
 
-      const blob = await response.blob();
-      console.log(`Decryption succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${latency.toFixed(0)}ms`);
-      return { success: true, data: blob, latency, processedBy };
+      console.error(`❌ All nodes failed: ${errors}`);
+      return { 
+        success: false, 
+        error: `All nodes failed: ${errors}`, 
+        latency: totalLatency 
+      };
     } catch (error) {
       const latency = performance.now() - startTime;
       console.error('Decryption error:', error);
-      return { success: false, error: String(error), latency };
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      let friendlyError = errorMsg;
+      
+      if (errorMsg.includes('AbortError')) {
+        friendlyError = 'Request timeout: Large file took too long to process. Try with a smaller image or ensure servers have adequate resources.';
+      } else if (errorMsg.includes('Failed to fetch')) {
+        friendlyError = 'Network error: Cannot connect to servers. Make sure all 3 nodes are running.';
+      }
+      
+      return { 
+        success: false, 
+        error: `Network error: ${friendlyError}`, 
+        latency 
+      };
     }
   }
 

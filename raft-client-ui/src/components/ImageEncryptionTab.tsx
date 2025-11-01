@@ -15,6 +15,7 @@ export function ImageEncryptionTab() {
   const [decryptingNode, setDecryptingNode] = useState<number | null>(null);
   const [latency, setLatency] = useState<number | null>(null);
   const [decryptLatency, setDecryptLatency] = useState<number | null>(null);
+  const [manualEncryptionKey, setManualEncryptionKey] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const stegoFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -26,6 +27,8 @@ export function ImageEncryptionTab() {
   const [stressTestStats, setStressTestStats] = useState<NodeStats[]>([]);
   const [throughputTimeSeries, setThroughputTimeSeries] = useState<TimeSeriesDataPoint[]>([]);
   const [latencyTimeSeries, setLatencyTimeSeries] = useState<TimeSeriesDataPoint[]>([]);
+  const [enableFailureTests, setEnableFailureTests] = useState(false);
+  const [failureEvents, setFailureEvents] = useState<Array<{ time: number; node: number; event: string; requestNum: number }>>([]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -50,8 +53,9 @@ export function ImageEncryptionTab() {
     try {
       const result = await apiClient.uploadImageToCluster(selectedFile);
 
-      if (result.success && result.data) {
+      if (result.success && result.data && result.key) {
         setEncryptedBlob(result.data);
+        setManualEncryptionKey(result.key);
         setProcessingNode(result.nodeId || null);
         setLatency(result.latency);
       } else {
@@ -78,21 +82,35 @@ export function ImageEncryptionTab() {
   };
 
   const handleDecrypt = async (stegoFile: File) => {
+    if (!manualEncryptionKey) {
+      alert('❌ Please enter the encryption key');
+      return;
+    }
+
+    if (!manualEncryptionKey.match(/^[0-9a-f]+$/i)) {
+      alert('❌ Encryption key must be in hexadecimal format (0-9 and a-f)');
+      return;
+    }
+
     setIsDecrypting(true);
     setDecryptLatency(null);
 
     try {
-      const result = await apiClient.decryptImageFromCluster(stegoFile);
+      console.log(`🔓 Starting decryption with key length: ${manualEncryptionKey.length}`);
+      const result = await apiClient.decryptImageFromCluster(stegoFile, manualEncryptionKey);
 
       if (result.success && result.data) {
         setDecryptedBlob(result.data);
         setDecryptingNode(result.nodeId || null);
         setDecryptLatency(result.latency);
+        console.log(`✅ Decryption succeeded on node ${result.nodeId}, latency: ${result.latency}ms`);
       } else {
-        alert(`Decryption failed: ${result.error}`);
+        console.error(`❌ Decryption failed: ${result.error}`);
+        alert(`❌ Decryption failed:\n\n${result.error}\n\nPlease check:\n1. The encryption key is correct\n2. The stego image is intact\n3. At least one server node is running\n\nCheck browser console for more details.`);
       }
     } catch (error) {
-      alert(`Error: ${error}`);
+      console.error('❌ Decryption error:', error);
+      alert(`❌ Error during decryption:\n\n${error instanceof Error ? error.message : String(error)}\n\nCheck browser console for more details.`);
     } finally {
       setIsDecrypting(false);
     }
@@ -111,7 +129,7 @@ export function ImageEncryptionTab() {
     const url = URL.createObjectURL(decryptedBlob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'decrypted-image.bin';
+    a.download = 'decrypted-image.png';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -129,6 +147,7 @@ export function ImageEncryptionTab() {
     setStressTestStats([]); // Clear previous stats
     setThroughputTimeSeries([]); // Clear previous throughput data
     setLatencyTimeSeries([]); // Clear previous latency data
+    setFailureEvents([]); // Clear previous failure events
 
     const stats = new Map<number, { 
       success: number; 
@@ -142,8 +161,90 @@ export function ImageEncryptionTab() {
     });
 
     const startTime = Date.now();
-    const requestsPerThread = Math.floor(stressTestTotal / stressTestThreads);
+    const requestsPerThread = stressTestTotal; // stressTestTotal is now requests per thread
     let completedRequests = 0;
+    
+    // Failure testing configuration - all nodes can fail, but at least 1 must be up
+    const failedNodes = new Set<number>(); // Track currently failed nodes
+    const nodeFailureSchedule = new Map<number, number>(); // node -> next failure request count
+    const maxSimultaneousFailures = 2; // Max 2 nodes can be down at once (ensures 1 is always up)
+    const maxFailuresPerNode = 3;
+    const nodeFailureCount = new Map<number, number>([[1, 0], [2, 0], [3, 0]]);
+    
+    // Initialize first failure for each node at random intervals
+    if (enableFailureTests) {
+      nodeFailureSchedule.set(1, Math.floor(Math.random() * 50) + 50);  // 50-100
+      nodeFailureSchedule.set(2, Math.floor(Math.random() * 100) + 50); // 50-150
+      nodeFailureSchedule.set(3, Math.floor(Math.random() * 80) + 60);  // 60-140
+    }
+    
+    // Background failure manager - ensures at least 1 node always up
+    const failureManager = async () => {
+      if (!enableFailureTests) return;
+      
+      console.log(`🎲 Failure testing enabled: All nodes can fail randomly, but at least 1 node always stays up`);
+      
+      while (completedRequests < stressTestTotal) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        
+        // Check each node for scheduled failures
+        for (const nodeId of [1, 2, 3]) {
+          const nextFailure = nodeFailureSchedule.get(nodeId);
+          const failureCount = nodeFailureCount.get(nodeId) || 0;
+          
+          // Check if this node should fail now
+          if (
+            nextFailure !== undefined &&
+            completedRequests >= nextFailure &&
+            failureCount < maxFailuresPerNode &&
+            !failedNodes.has(nodeId)
+          ) {
+            // Safety check: Don't fail if it would leave us with no nodes
+            if (failedNodes.size >= maxSimultaneousFailures) {
+              console.log(`⚠️  Node ${nodeId} failure skipped - already ${failedNodes.size} nodes down`);
+              // Reschedule for later
+              nodeFailureSchedule.set(nodeId, completedRequests + 50);
+              continue;
+            }
+            
+            // Fail the node
+            failedNodes.add(nodeId);
+            nodeFailureCount.set(nodeId, failureCount + 1);
+            const currentCount = completedRequests;
+            
+            console.log(`💥 [SIMULATED] Node ${nodeId} failure #${failureCount + 1} at ${currentCount} requests (${failedNodes.size} nodes down)`);
+            setFailureEvents(prev => [...prev, { 
+              time: Date.now(), 
+              node: nodeId, 
+              event: 'STOPPED', 
+              requestNum: currentCount 
+            }]);
+            
+            // Schedule recovery with random delay (5-15 seconds)
+            const recoveryDelay = (Math.random() * 10000) + 5000;
+            setTimeout(() => {
+              failedNodes.delete(nodeId);
+              console.log(`🔄 [SIMULATED] Node ${nodeId} recovered after ${(recoveryDelay/1000).toFixed(1)}s (${failedNodes.size} nodes down)`);
+              setFailureEvents(prev => [...prev, { 
+                time: Date.now(), 
+                node: nodeId, 
+                event: 'STARTED', 
+                requestNum: completedRequests 
+              }]);
+            }, recoveryDelay);
+            
+            // Schedule next failure for this node with random interval
+            const intervalMin = nodeId === 1 ? 50 : (nodeId === 2 ? 50 : 60);
+            const intervalMax = nodeId === 1 ? 100 : (nodeId === 2 ? 150 : 140);
+            const nextInterval = Math.floor(Math.random() * (intervalMax - intervalMin)) + intervalMin;
+            nodeFailureSchedule.set(nodeId, currentCount + nextInterval);
+          }
+        }
+      }
+    };
+    
+    // Start failure manager if enabled
+    const failureManagerPromise = enableFailureTests ? failureManager() : Promise.resolve();
 
     // Helper function to calculate and update stats
     const updateStatsDisplay = () => {
@@ -237,6 +338,9 @@ export function ImageEncryptionTab() {
     }
 
     await Promise.all(threads);
+    
+    // Wait for failure manager to complete if enabled
+    await failureManagerPromise;
 
     // Final stats update and graphs - ONLY shown at the end
     updateStatsDisplay();
@@ -388,6 +492,28 @@ export function ImageEncryptionTab() {
             <p className="text-sm text-gray-600 mb-2">
               Processed by Node {processingNode} • Latency: {latency?.toFixed(0)}ms
             </p>
+            
+            {/* Display Encryption Key */}
+            {manualEncryptionKey && (
+              <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded">
+                <p className="text-sm font-semibold text-yellow-800 mb-2">🔑 Encryption Key (Save this!)</p>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 p-2 bg-white border rounded text-xs font-mono break-all">
+                    {manualEncryptionKey}
+                  </code>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(manualEncryptionKey);
+                      alert('Key copied to clipboard!');
+                    }}
+                    className="px-3 py-1 bg-yellow-600 text-white rounded text-sm hover:bg-yellow-700"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
+            
             <button
               onClick={handleDownload}
               className="flex items-center gap-2 px-4 py-2 bg-purple-500 text-white rounded hover:bg-purple-600"
@@ -402,8 +528,25 @@ export function ImageEncryptionTab() {
         <div className="mt-8 pt-8 border-t">
           <h2 className="text-xl font-bold mb-4">Decryption</h2>
           <p className="text-sm text-gray-600 mb-4">
-            Upload a stego image to extract the hidden data
+            Upload a stego image and provide the encryption key to extract the hidden data
           </p>
+
+          {/* Encryption Key Input */}
+          <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded">
+            <label className="block text-sm font-semibold text-blue-900 mb-2">
+              🔑 Encryption Key (Required for Decryption)
+            </label>
+            <textarea
+              value={manualEncryptionKey}
+              onChange={(e) => setManualEncryptionKey(e.target.value)}
+              placeholder="Paste the encryption key from your encryption here..."
+              className="w-full p-2 border rounded font-mono text-sm"
+              rows={3}
+            />
+            <p className="text-xs text-blue-700 mt-2">
+              If you just encrypted an image above, the key is automatically populated here.
+            </p>
+          </div>
 
           {/* File Input for Decryption */}
           <div className="mb-6">
@@ -416,11 +559,20 @@ export function ImageEncryptionTab() {
             />
             <button
               onClick={() => stegoFileInputRef.current?.click()}
-              disabled={isDecrypting}
+              disabled={isDecrypting || !manualEncryptionKey}
               className="flex items-center gap-2 px-6 py-3 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed"
             >
-              <Upload size={20} />
-              Select Stego Image to Decrypt
+              {isDecrypting ? (
+                <>
+                  <Loader2 size={20} className="animate-spin" />
+                  Decrypting...
+                </>
+              ) : (
+                <>
+                  <Upload size={20} />
+                  Select Stego Image to Decrypt
+                </>
+              )}
             </button>
           </div>
 
@@ -431,12 +583,23 @@ export function ImageEncryptionTab() {
               <p className="text-sm text-gray-600 mb-2">
                 Processed by Node {decryptingNode} • Latency: {decryptLatency?.toFixed(0)}ms
               </p>
+              
+              {/* Preview of decrypted image */}
+              <div className="mb-3">
+                <img 
+                  src={URL.createObjectURL(decryptedBlob)} 
+                  alt="Decrypted" 
+                  className="max-w-full h-auto rounded border"
+                  style={{ maxHeight: '200px' }}
+                />
+              </div>
+              
               <button
                 onClick={handleDownloadDecrypted}
                 className="flex items-center gap-2 px-4 py-2 bg-indigo-500 text-white rounded hover:bg-indigo-600"
               >
                 <Download size={20} />
-                Download Extracted Data
+                Download Decrypted Image
               </button>
             </div>
           )}
@@ -449,7 +612,7 @@ export function ImageEncryptionTab() {
 
         <div className="grid grid-cols-2 gap-4 mb-4">
           <div>
-            <label className="block text-sm font-medium mb-1">Total Requests</label>
+            <label className="block text-sm font-medium mb-1">Requests per Thread</label>
             <input
               type="number"
               value={stressTestTotal}
@@ -458,6 +621,9 @@ export function ImageEncryptionTab() {
               className="w-full px-3 py-2 border rounded"
               min="1"
             />
+            <p className="text-xs text-gray-500 mt-1">
+              Total: {stressTestTotal * stressTestThreads} requests
+            </p>
           </div>
           <div>
             <label className="block text-sm font-medium mb-1">Concurrent Threads</label>
@@ -471,6 +637,29 @@ export function ImageEncryptionTab() {
               max="50"
             />
           </div>
+        </div>
+        
+        {/* Failure Testing Toggle */}
+        <div className="mb-4 p-4 border rounded bg-amber-50">
+          <label className="flex items-center gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={enableFailureTests}
+              onChange={(e) => setEnableFailureTests(e.target.checked)}
+              disabled={isStressTesting}
+              className="w-5 h-5 cursor-pointer"
+            />
+            <div>
+              <span className="font-medium text-amber-900">Enable Automated Failure Testing</span>
+              <p className="text-sm text-amber-700 mt-1">
+                Simulates realistic server failures during stress test:
+                <br />• <strong>All 3 nodes can fail</strong> at random intervals (50-150 requests)
+                <br />• <strong>At least 1 node always stays up</strong> (max 2 nodes down simultaneously)
+                <br />• Up to 3 failures per node, each recovering after 5-15 seconds
+                <br />• Tests Raft's resilience and automatic load redistribution
+              </p>
+            </div>
+          </label>
         </div>
 
         <div className="flex gap-4 mb-4">
@@ -499,13 +688,13 @@ export function ImageEncryptionTab() {
             <div className="flex justify-between text-sm mb-1">
               <span>Progress</span>
               <span>
-                {stressTestProgress} / {stressTestTotal}
+                {stressTestProgress} / {stressTestTotal * stressTestThreads}
               </span>
             </div>
             <div className="w-full bg-gray-200 rounded-full h-4">
               <div
                 className="bg-blue-500 h-4 rounded-full transition-all"
-                style={{ width: `${(stressTestProgress / stressTestTotal) * 100}%` }}
+                style={{ width: `${(stressTestProgress / (stressTestTotal * stressTestThreads)) * 100}%` }}
               />
             </div>
           </div>
@@ -514,7 +703,53 @@ export function ImageEncryptionTab() {
         {/* Stats */}
         {stressTestStats.length > 0 && (
           <div className="border-t pt-4">
-            <h3 className="font-semibold mb-2">Test Results</h3>
+            <h3 className="font-semibold mb-4">Test Results</h3>
+            
+            {/* Test Summary */}
+            <div className="bg-blue-50 border border-blue-200 rounded p-4 mb-4">
+              <div className="grid grid-cols-3 gap-4 mb-3">
+                <div>
+                  <p className="text-sm text-gray-600">Total Requests Sent</p>
+                  <p className="text-2xl font-bold text-blue-600">{stressTestTotal * stressTestThreads}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-600">Total Completed</p>
+                  <p className="text-2xl font-bold text-green-600">
+                    {stressTestStats.reduce((sum, s) => sum + s.requestsSent, 0)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-600">Success Rate</p>
+                  <p className="text-2xl font-bold text-green-600">
+                    {stressTestStats.reduce((sum, s) => sum + s.successCount, 0) > 0
+                      ? (
+                          (stressTestStats.reduce((sum, s) => sum + s.successCount, 0) /
+                            stressTestStats.reduce((sum, s) => sum + s.requestsSent, 0)) *
+                          100
+                        ).toFixed(1)
+                      : '0'}
+                    %
+                  </p>
+                </div>
+              </div>
+              <div className="border-t pt-3">
+                <p className="text-sm font-medium mb-2">Distribution per Node:</p>
+                <div className="grid grid-cols-3 gap-2 text-sm">
+                  {stressTestStats.map((stat) => {
+                    const total = stressTestStats.reduce((sum, s) => sum + s.requestsSent, 0);
+                    const percentage = total > 0 ? ((stat.requestsSent / total) * 100).toFixed(1) : '0';
+                    return (
+                      <div key={stat.nodeId} className="p-2 bg-white rounded border">
+                        <span className="font-medium">Node {stat.nodeId}:</span>
+                        <span className="ml-2">{stat.requestsSent} ({percentage}%)</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Results Table */}
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-gray-100">
@@ -686,6 +921,65 @@ export function ImageEncryptionTab() {
                 </ResponsiveContainer>
               </div>
             </div>
+          </div>
+        )}
+        
+        {/* Failure Events Log */}
+        {failureEvents.length > 0 && (
+          <div className="mt-6 border rounded p-4 bg-amber-50">
+            <h3 className="font-semibold mb-3 text-amber-900">🔧 Failure Testing Events</h3>
+            
+            {/* Current Status Summary */}
+            <div className="mb-3 p-3 bg-white rounded border">
+              <div className="text-sm font-medium mb-2">Current Node Status:</div>
+              <div className="flex gap-2">
+                {[1, 2, 3].map(nodeId => {
+                  // Find last event for this node
+                  const lastEvent = [...failureEvents]
+                    .reverse()
+                    .find(e => e.node === nodeId);
+                  const isUp = !lastEvent || lastEvent.event === 'STARTED';
+                  
+                  return (
+                    <div 
+                      key={nodeId}
+                      className={`px-3 py-1 rounded text-sm font-medium ${
+                        isUp 
+                          ? 'bg-green-100 text-green-800' 
+                          : 'bg-red-100 text-red-800'
+                      }`}
+                    >
+                      Node {nodeId}: {isUp ? '✅ UP' : '💥 DOWN'}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            
+            {/* Events Timeline */}
+            <div className="space-y-1 max-h-60 overflow-y-auto">
+              {failureEvents.map((event, idx) => {
+                const time = new Date(event.time).toLocaleTimeString();
+                const isFailure = event.event === 'STOPPED';
+                return (
+                  <div 
+                    key={idx} 
+                    className={`text-sm p-2 rounded ${isFailure ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'}`}
+                  >
+                    <span className="font-mono">[{time}]</span>
+                    {' '}
+                    <span className="font-semibold">Request #{event.requestNum}</span>
+                    {' → '}
+                    {isFailure ? '💥' : '🔄'} Node {event.node} {event.event}
+                  </div>
+                );
+              })}
+            </div>
+            <p className="text-xs text-amber-700 mt-3">
+              Note: These are simulated failures for testing purposes. 
+              The system ensures at least 1 node is always available to maintain service continuity.
+              In production, Raft consensus handles real failures automatically.
+            </p>
           </div>
         )}
       </div>

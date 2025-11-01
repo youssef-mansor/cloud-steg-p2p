@@ -224,7 +224,30 @@ async fn main() -> Result<()> {
         self_http_addr: normalized_self_http,
         healthy_nodes: Arc::new(tokio::sync::RwLock::new(healthy_nodes)),
         node_latencies: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
+        node_throughput: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
     };
+    
+    // Spawn periodic task to recalculate throughput every second
+    let throughput_state = app_state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            
+            // Calculate throughput for each node based on requests completed in last period
+            let mut throughput = throughput_state.node_throughput.write().await;
+            
+            for (node_id, stats) in throughput.iter_mut() {
+                // Throughput = completed requests in this second
+                stats.throughput_req_per_sec = stats.completed_requests as f64;
+                
+                println!("📊 Node {} throughput: {:.1} req/sec ({} requests this period)", 
+                         node_id, stats.throughput_req_per_sec, stats.completed_requests);
+                
+                // Reset counter for next period
+                stats.completed_requests = 0;
+            }
+        }
+    });
 
     let app = api::create_router(app_state);
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
