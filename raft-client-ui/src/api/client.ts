@@ -2,9 +2,9 @@ import type { ApiResponse, NodeMetrics } from '../types';
 
 // Default server addresses - can be configured
 const DEFAULT_NODES = [
-  { id: 1, httpAddr: 'http://localhost:8001' },
-  { id: 2, httpAddr: 'http://localhost:8002' },
-  { id: 3, httpAddr: 'http://localhost:8003' },
+  { id: 1, httpAddr: 'http://10.40.49.211:8001' },
+  { id: 2, httpAddr: 'http://10.40.41.162:8002' },
+  { id: 3, httpAddr: 'http://10.40.46.168:8003' },
 ];
 
 export class RaftApiClient {

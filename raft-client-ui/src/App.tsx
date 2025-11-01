@@ -67,7 +67,7 @@ function App() {
               Raft OpenRaft Demo Client • Built with React + TypeScript + Vite
             </p>
             <div className="flex gap-4 text-sm text-gray-400">
-              <span>Default Nodes: localhost:8001, 8002, 8003</span>
+              <span>Default Nodes: 10.40.49.211:8001, 10.40.41.162:8002, 10.40.46.168:8003</span>
             </div>
           </div>
         </div>
