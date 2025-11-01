@@ -1,320 +1,520 @@
-# Raft Consensus Cluster - Verification Guide
+# Load Balancing Architecture & Test Guide
 
-This is a **3-node Raft consensus cluster** built with OpenRaft. It demonstrates:
-- Leader election with automatic failover
-- Log replication across nodes
-- Dynamic cluster membership changes
-- Resilience to node failures
+## Table of Contents
+1. [Quick Start - Running the Test](#quick-start)
+2. [Architecture Overview](#architecture-overview)
+3. [Client Architecture](#client-architecture)
+4. [Server Architecture](#server-architecture)
+5. [Design Decisions](#design-decisions)
+6. [Testing Guide](#testing-guide)
 
-## What Is Raft?
-
-Raft is a consensus algorithm that keeps distributed systems synchronized. Key properties:
-- **At most one leader** per term at any time
-- **Log replication** ensures all nodes have identical logs
-- **Automatic failover** when leader crashes
-- **Safety** guarantees no data loss or inconsistency
-
-See: https://raft.github.io
-
-## Architecture
-
-```
-Node 1 (Leader)         Node 2 (Follower)       Node 3 (Follower)
-├─ HTTP API :8001       ├─ HTTP API :8002       ├─ HTTP API :8003
-├─ RPC Server :7001     ├─ RPC Server :7002     ├─ RPC Server :7003
-└─ Storage (Memory)     └─ Storage (Memory)     └─ Storage (Memory)
-```
-
-**Components:**
-- HTTP API: Cluster management (`/cluster/init`, `/cluster/add-learner`, etc.)
-- RPC Layer: Binary-encoded Raft protocol messages (AppendEntries, Vote)
-- Storage: In-memory state machine
-- Raft Engine: Consensus protocol (OpenRaft library)
+---
 
 ## Quick Start
 
-### Build
-```
+### Prerequisites
+```bash
+# 1. Build the project (release mode for best performance)
+cd raft-openraft-demo
 cargo build --release
+
+# 2. Ensure test image exists
+ls input-image.png  # Should exist
 ```
 
-### Run 3-Node Cluster (Local)
+### Step-by-Step Terminal Instructions
 
-**Terminal 1 - Node 1:**
-```
-cargo run -- \
+#### Terminal 1 - Node 1 (Leader Candidate)
+```bash
+cd raft-openraft-demo
+cargo run --release -- \
   --id 1 \
   --http-addr 0.0.0.0:8001 \
   --rpc-addr 0.0.0.0:7001 \
   --peers "2=127.0.0.1:7002,3=127.0.0.1:7003"
 ```
 
-**Terminal 2 - Node 2:**
-```
-cargo run -- \
+**Wait for:** `🌐 HTTP API listening on 0.0.0.0:8001`
+
+#### Terminal 2 - Node 2 (Follower)
+```bash
+cd raft-openraft-demo
+cargo run --release -- \
   --id 2 \
   --http-addr 0.0.0.0:8002 \
   --rpc-addr 0.0.0.0:7002 \
   --peers "1=127.0.0.1:7001,3=127.0.0.1:7003"
 ```
 
-**Terminal 3 - Node 3:**
-```
-cargo run -- \
+**Wait for:** `🌐 HTTP API listening on 0.0.0.0:8002`
+
+#### Terminal 3 - Node 3 (Follower)
+```bash
+cd raft-openraft-demo
+cargo run --release -- \
   --id 3 \
   --http-addr 0.0.0.0:8003 \
   --rpc-addr 0.0.0.0:7003 \
   --peers "1=127.0.0.1:7001,2=127.0.0.1:7002"
 ```
 
-## Verification Tests
+**Wait for:** `🌐 HTTP API listening on 0.0.0.0:8003`
 
-### Test 1: Initial State (All Learners)
+#### Terminal 4 - Initialize & Test
+```bash
+# Step 1: Wait 5-10 seconds for all nodes to start
 
-All nodes start as **Learners** (non-voting members):
+# Step 2: Initialize the cluster
+cd raft-openraft-demo
+./setup.sh
 
-```
-curl http://127.0.0.1:8001/metrics | jq '.data.state'
-# Expected: "Learner"
-
-curl http://127.0.0.1:8002/metrics | jq '.data.state'
-# Expected: "Learner"
-
-curl http://127.0.0.1:8003/metrics | jq '.data.state'
-# Expected: "Learner"
+# Step 3: Run multi-threaded load balancing test
+python3 test_load_balancing_threaded.py
 ```
 
-### Test 2: Cluster Initialization
+---
 
-Initialize Node 1 as the **single-node cluster** (becomes Leader):
-
-```
-curl -X POST http://127.0.0.1:8001/cluster/init \
-  -H 'Content-Type: application/json' \
-  -d '{}'
-```
-
-**Verify Node 1 is now Leader:**
-```
-curl http://127.0.0.1:8001/metrics | jq '.data | {state, current_leader, current_term}'
-# Expected:
-# {
-#   "state": "Leader",
-#   "current_leader": 1,
-#   "current_term": 1
-# }
-```
-
-### Test 3: Add Learners
-
-Add Nodes 2 and 3 as **Learners** (they receive log entries but don't vote):
+## Architecture Overview
 
 ```
-curl -X POST http://127.0.0.1:8001/cluster/add-learner \
-  -H 'Content-Type: application/json' \
-  -d '{"node_id": 2, "address": "127.0.0.1:7002"}'
-
-curl -X POST http://127.0.0.1:8001/cluster/add-learner \
-  -H 'Content-Type: application/json' \
-  -d '{"node_id": 3, "address": "127.0.0.1:7003"}'
+┌─────────────────────────────────────────────────────────────┐
+│                    CLIENT (Multi-Threaded)                   │
+│  ┌────────┐  ┌────────┐  ┌────────┐  ...  ┌────────┐      │
+│  │Thread 1│  │Thread 2│  │Thread 3│       │Thread N│      │
+│  │200 req │  │200 req │  │200 req │       │200 req │      │
+│  └────┬───┘  └────┬───┘  └────┬───┘       └────┬───┘      │
+│       │           │           │                 │           │
+│       └───────────┴───────────┴─────────────────┘           │
+│                  │                                           │
+│                  │ Multicast to All 3 Nodes                  │
+└──────────────────┼───────────────────────────────────────────┘
+                    │
+        ┌───────────┼───────────┐
+        │           │           │
+        ▼           ▼           ▼
+┌───────────┐ ┌───────────┐ ┌───────────┐
+│  Node 1   │ │  Node 2   │ │  Node 3   │
+│ (Leader)  │ │(Follower) │ │(Follower) │
+│  :8001    │ │  :8002    │ │  :8003    │
+├───────────┤ ├───────────┤ ├───────────┤
+│ HTTP API  │ │ HTTP API  │ │ HTTP API  │
+│  503 ✗    │ │  503 ✗    │ │           │
+│           │ │           │ │           │
+│  ┌──────┐ │ │           │ │           │
+│  │Load  │ │ │           │ │           │
+│  │Bal.  │ │ │           │ │           │
+│  └──┬───┘ │ │           │ │           │
+│     │     │ │           │ │           │
+│     ▼     │ │           │ │           │
+│ Forward   │ │           │ │           │
+│ Randomly  ─┼─┼───────────┼─┼───────────┤
+│           │ │           │ │           │
+├───────────┤ ├───────────┤ ├───────────┤
+│ RPC :7001 │ │ RPC :7002 │ │ RPC :7003 │
+│           │ │           │ │           │
+│ Raft      │ │ Raft      │ │ Raft      │
+│ Consensus │ │ Consensus │ │ Consensus │
+└───────────┘ └───────────┘ └───────────┘
 ```
 
-**Wait 2-3 seconds for replication, then verify:**
-```
-curl http://127.0.0.1:8002/metrics | jq '.data | {state, current_leader, membership_config}'
-# Expected:
-# {
-#   "state": "Learner",
-#   "current_leader": 1,
-#   "membership_config": {
-#     "membership": {
-#       "configs": [],[11][12]
-#       "nodes": {"1": null, "2": null, "3": null}
-#     }
-#   }
-# }
-```
+---
 
-### Test 4: Promote to Voters
+## Client Architecture
 
-Change membership to make all nodes **voters** (can participate in leader elections):
+### Multi-Threaded Test Client (`test_load_balancing_threaded.py`)
 
-```
-curl -X POST http://127.0.0.1:8001/cluster/change-membership \
-  -H 'Content-Type: application/json' \
-  -d '{"members": }'[12][11]
-```
+**Design:**
+- **20 concurrent threads** by default (configurable)
+- Each thread sends `TOTAL_REQUESTS // NUM_THREADS` requests
+- Thread-safe result aggregation using locks
 
-**Wait 2 seconds, then verify all are synchronized:**
-```
-curl http://127.0.0.1:8001/metrics | jq '.data | {state, current_term}'
-curl http://127.0.0.1:8002/metrics | jq '.data | {state, current_term}'
-curl http://127.0.0.1:8003/metrics | jq '.data | {state, current_term}'
+**Request Flow:**
+1. Each thread iterates through its assigned request range
+2. For each request:
+   - **Multicasts to all 3 nodes simultaneously** using `ThreadPoolExecutor`
+   - Waits for all 3 responses in parallel
+   - Accepts first successful response (HTTP 200)
+   - If all fail, retries up to 4 times with progressive delays
+3. Results aggregated thread-safely with locks
 
-# Expected: All show current_term: 1, Node 1 is Leader, Nodes 2-3 are Followers
-```
+**Key Components:**
 
-### Test 5: Leader Election (Core Raft Test!)
+```python
+# Configuration
+TOTAL_REQUESTS = 10000    # Total requests to send
+NUM_THREADS = 20          # Concurrent threads
+MAX_RETRIES = 4           # Retry attempts per request
+TIMEOUT = 10              # Request timeout (seconds)
 
-**Kill the leader (Node 1)** in Terminal 1: Press `Ctrl+C`
-
-**Immediately check Nodes 2 and 3:**
-```
-curl http://127.0.0.1:8002/metrics | jq '.data | {state, current_leader, current_term}'
-curl http://127.0.0.1:8003/metrics | jq '.data | {state, current_leader, current_term}'
+# Thread-safe state
+counters_lock = Lock()           # Protects shared counters
+node_counts = defaultdict(int)   # Tracks requests per node
+success_count = [0]              # Total successes
+failure_count = [0]              # Total failures
 ```
 
-**Expected behavior:**
-- ✅ `current_term` incremented (1 → 2)
-- ✅ One node becomes **Leader** (state: "Leader")
-- ✅ One node is **Follower** (state: "Follower")
-- ✅ Both nodes recognize the new leader
-
-**Example successful output (Node 3 elected):**
+**Multicast Implementation:**
+```python
+# Sends to all 3 nodes in parallel
+with ThreadPoolExecutor(max_workers=3) as executor:
+    futures = {
+        executor.submit(post_to_node, port): port
+        for port in [8001, 8002, 8003]
+    }
+    # Wait for all responses, accept first 200
 ```
-{
-  "state": "Follower",
-  "current_leader": 3,
-  "current_term": 2
+
+**Retry Logic:**
+- Progressive delays: 0.2s, 0.5s, 0.8s, 1.1s between retries
+- Gives time for leader election or node recovery
+- Client-side retry ensures resilience to transient failures
+
+**Why This Design:**
+- **Multicast pattern** ensures requests reach all nodes (followers reject, leader processes)
+- **Threading** simulates realistic concurrent load
+- **Client-side retry** handles temporary failures without server complexity
+
+---
+
+## Server Architecture
+
+### Rust Async Runtime (Tokio)
+
+**Runtime Configuration:**
+```rust
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
+```
+- **8 worker threads** for true parallelism across CPU cores
+- Multi-threaded scheduler allows concurrent task execution
+- Ideal for I/O-bound and CPU-mixed workloads
+
+### HTTP Request Handling (Axum)
+
+**Concurrency Model:**
+- Axum server handles requests concurrently
+- Each request handler is `async` and non-blocking
+- Multiple requests processed simultaneously on different worker threads
+- No request blocks another (except for shared resources like locks)
+
+**Request Flow:**
+```
+Client Request → Axum Router → Handler (async)
+                             ↓
+                    Check if Leader
+                    ↓           ↓
+                Yes            No
+                 ↓              ↓
+        Process or Forward    Return 503
+                 ↓
+        Get Random Healthy Node
+                 ↓
+        Forward or Process Locally
+```
+
+**Health Tracking:**
+- Nodes marked healthy/unhealthy based on forwarding success/failure
+- Only healthy nodes selected for load balancing
+- Probation mechanism (20% chance) gives unhealthy nodes recovery opportunity
+
+### CPU-Intensive Operations
+
+**Steganography Processing:**
+- Image encryption and embedding is CPU-intensive
+- Spawned in `tokio::task::spawn_blocking()` to avoid blocking async runtime
+- Multiple stego operations can run in parallel on different threads
+- Allows concurrent processing of multiple requests
+
+```rust
+// Before (blocking):
+match embed_image_into_cover(&body[..]) { ... }
+
+// After (non-blocking):
+match tokio::task::spawn_blocking(move || {
+    embed_image_into_cover(&body_clone[..])
+}).await { ... }
+```
+
+### RPC (Server-to-Server) Communication
+
+**Architecture:**
+- Each incoming RPC connection spawns separate async task (`tokio::spawn`)
+- Multiple Raft protocol messages handled concurrently
+- Raft operations are async and non-blocking
+
+**Message Types:**
+1. **AppendEntries**: Log replication from leader to followers
+2. **Vote**: Election requests during leader election
+3. **InstallSnapshot**: State synchronization for catch-up
+
+**Connection Handling:**
+```rust
+loop {
+    let (socket, addr) = listener.accept().await?;
+    tokio::spawn(async move {
+        handle_rpc_connection(socket, raft).await
+    });
 }
 ```
 
-```
-{
-  "state": "Leader",
-  "current_leader": 3,
-  "current_term": 2
-}
-```
+### Raft Consensus Layer
 
-### Test 6: Restart Failed Node
+**Leader Election:**
+- Runs in separate async tasks (handled by OpenRaft)
+- Non-blocking, managed by OpenRaft library
+- Election timeouts and heartbeats managed concurrently
 
-**Restart Node 1** in Terminal 1:
-```
-cargo run -- \
-  --id 1 \
-  --http-addr 0.0.0.0:8001 \
-  --rpc-addr 0.0.0.0:7001 \
-  --peers "2=127.0.0.1:7002,3=127.0.0.1:7003"
-```
+**Log Replication:**
+- Forwarded to followers in parallel
+- Each forward operation is async
+- Health tracking happens concurrently with replication
 
-**Check Node 1's state (should become Follower):**
-```
-curl http://127.0.0.1:8001/metrics | jq '.data | {state, current_leader, current_term}'
-# Expected: state: "Follower", current_leader: 3, current_term: 2
-```
+**State Management:**
+- `Arc<RaftNode>` - Shared reference to Raft state machine
+- Thread-safe for concurrent access
+- Metrics and state queries don't block operations
 
-✅ Node 1 recovered and recognized Node 3 as leader!
+---
 
-### Test 7: Repeated Leader Elections
+## Design Decisions
 
-Kill and restart the leader multiple times. Each time:
-- Remaining followers detect failure
-- New leader elected within 1-3 seconds
-- Restarted node rejoins as follower
-- System remains available (no data loss)
+### 1. Multicast Request Pattern
 
-```
-# Kill current leader, wait 2 seconds
-# Check: New leader elected
-# Restart: Old leader rejoins
-# Repeat 3-5 times
-```
+**Decision:** Client sends every request to all 3 nodes simultaneously
 
-## What Each Metric Means
+**Rationale:**
+- **Simplicity**: Client doesn't need to know which node is leader
+- **Resilience**: If one node is down, others may still respond
+- **Load Distribution**: Leader automatically distributes to healthy nodes
 
-```
-curl http://127.0.0.1:8001/metrics | jq '.data'
-```
+**Trade-offs:**
+- ✅ No client-side leader discovery needed
+- ✅ Natural failover if leader crashes
+- ❌ 3x network traffic (but followers reject quickly with 503)
+- ❌ Extra requests to followers (but they reject immediately)
 
-| Field | Meaning |
-|-------|---------|
-| `state` | Node role: `Leader`, `Follower`, or `Learner` |
-| `current_term` | Election term (increments on each election) |
-| `current_leader` | Node ID of current leader |
-| `is_voter` | Can this node vote in elections? |
-| `membership_config` | Cluster members and log index |
-| `membership_config.log_id.index` | Replicated log index |
+### 2. Leader-Only Processing
 
-## Raft Guarantees Verified
+**Decision:** Only leader accepts direct client requests; followers reject with 503
 
-| Property | How to Verify |
-|----------|---------------|
-| **Leader Election** | Kill leader → new leader elected in 2-3 sec |
-| **Unique Leader** | At most one node with `state: "Leader"` per term |
-| **Log Replication** | All nodes have same `log_id.index` |
-| **Fault Tolerance** | Cluster continues with 2/3 nodes alive |
-| **No Data Loss** | Restarted node catches up with current leader |
+**Rationale:**
+- **Single Point of Control**: Leader decides load distribution
+- **Consistency**: All load balancing logic in one place
+- **Simplified State**: Only leader maintains health tracking
 
-## Files Structure
+**Trade-offs:**
+- ✅ Centralized load balancing logic
+- ✅ Consistent health tracking
+- ❌ Leader becomes bottleneck (mitigated by forwarding)
+- ❌ Followers waste CPU rejecting requests (minimal - quick 503)
 
-```
-src/
-├── main.rs           # Entry point, node initialization
-├── api.rs            # HTTP API endpoints
-├── rpc.rs            # RPC message definitions
-├── rpc_handler.rs    # RPC server (listens for incoming messages)
-├── network.rs        # RPC client (sends outgoing messages)
-├── types.rs          # Type definitions
-├── store.rs          # Storage layer
-└── store/
-    └── (impl details)
+### 3. Random Load Balancing
+
+**Decision:** Leader randomly selects healthy nodes (including self) for processing
+
+**Rationale:**
+- **Simplicity**: No complex algorithms needed
+- **Fair Distribution**: Random selection ensures roughly equal distribution
+- **Flexibility**: Easy to exclude unhealthy nodes
+
+**Implementation:**
+```rust
+// Filters to healthy nodes only
+let healthy_nodes = http_addrs.iter()
+    .filter(|(id, _)| healthy.get(id).unwrap_or(false))
+    .collect();
+let selected = random() % healthy_nodes.len();
 ```
 
-## Expected Output
+### 4. Health Tracking with Probation
 
-### Node 1 (Initial Leader)
+**Decision:** Track node health, but give unhealthy nodes 20% chance for recovery
+
+**Rationale:**
+- **Fail-Fast**: Don't waste requests on down nodes
+- **Recovery**: Unhealthy nodes can prove they're back
+- **Balance**: 80% healthy nodes, 20% probation for recovery
+
+**Flow:**
+1. Node forwarding fails → marked unhealthy
+2. Unhealthy nodes excluded from normal selection
+3. 20% chance to try unhealthy node (probation)
+4. If successful → marked healthy again
+5. If failed → remains unhealthy
+
+**Why 20%?**
+- Low enough to not significantly impact performance
+- High enough for rapid recovery (within ~5 requests on average)
+- Balances efficiency with resilience
+
+### 5. Client-Side Retry
+
+**Decision:** Client retries failed requests (multicast again) instead of server fallback
+
+**Rationale:**
+- **Separation of Concerns**: Client handles retries, server focuses on processing
+- **Flexibility**: Client can implement custom retry strategies
+- **Transparency**: Server returns errors; client decides what to do
+
+**Alternative Considered:**
+- Server-side fallback to alternative nodes
+- **Rejected because**: Adds complexity, requires stateful retry tracking
+
+### 6. Async Runtime with Blocking Tasks
+
+**Decision:** Use `spawn_blocking` for CPU-intensive work (steganography)
+
+**Rationale:**
+- **Non-Blocking I/O**: HTTP handlers don't wait for CPU work
+- **Parallelism**: Multiple blocking tasks can run on different threads
+- **Throughput**: Can process multiple images simultaneously
+
+**Thread Model:**
+- 8 worker threads for async tasks (I/O, forwarding)
+- Blocking pool (separate) for CPU-intensive work
+- Optimal utilization of all CPU cores
+
+### 7. Thread-Safe Shared State
+
+**Decision:** Use `Arc<RwLock<>>` for shared mutable state
+
+**Rationale:**
+- **Concurrency**: Multiple requests can read simultaneously
+- **Safety**: Writers lock exclusively
+- **Performance**: Read locks don't block other readers
+
+**State Protected:**
+- `healthy_nodes: Arc<RwLock<BTreeMap<NodeId, bool>>>`
+- `http_addresses: Arc<RwLock<BTreeMap<NodeId, String>>>`
+- `raft: Arc<RaftNode>` (OpenRaft handles internal synchronization)
+
+### 8. Timeouts
+
+**Decision:** 5s node-to-node, 10s client-to-server timeouts
+
+**Rationale:**
+- **Fail-Fast**: Don't wait indefinitely for crashed nodes
+- **Client Experience**: Reasonable timeout for user-facing requests
+- **Node Communication**: Shorter timeout for internal calls (faster failure detection)
+
+**Values:**
+- Client timeout (10s): Allows for network latency and processing
+- Forwarding timeout (5s): Internal calls should be faster
+
+---
+
+## Testing Guide
+
+### Basic Load Balancing Test
+
+```bash
+python3 test_load_balancing_threaded.py
 ```
-🚀 Node 1 starting
-✅ Raft node created (state: Learner)
-📋 Registered peer: node 2 -> 127.0.0.1:7002
-📋 Registered peer: node 3 -> 127.0.0.1:7003
-🌐 HTTP API listening on 0.0.0.0:8001
-🔌 RPC server listening on 0.0.0.0:7001
-📥 AppendEntries from term 1
-✅ AppendEntries succeeded
+
+**What It Tests:**
+- Request distribution across nodes
+- Load balancing fairness
+- Concurrent request handling
+- Multicast pattern functionality
+
+**Expected Results:**
+- Roughly 33% distribution per node
+- High success rate (>99%)
+- Throughput: Significantly higher than single-threaded
+
+### Failure Scenario Testing
+
+**Test Node Crash Recovery:**
+
+1. Start test: `python3 test_load_balancing_threaded.py`
+2. While running, kill a node (Ctrl+C in Terminal 2 or 3)
+3. Observe:
+   - Failures spike briefly
+   - Remaining nodes handle increased load
+   - Distribution adjusts (e.g., 50% each if one node down)
+4. Restart killed node
+5. Observe:
+   - Node marked unhealthy initially
+   - Probation requests test recovery
+   - Node regains load share once healthy
+
+**Test Leader Crash:**
+
+1. Kill the leader node
+2. Observe:
+   - Brief failure window during election
+   - New leader elected (visible in logs)
+   - Requests resume normally
+   - Client retries handle transient failures
+
+### Performance Benchmarks
+
+**Expected Metrics:**
+
+| Metric | Single-Threaded | Multi-Threaded (20 threads) |
+|--------|----------------|----------------------------|
+| **Throughput** | ~30 req/s | ~150-300 req/s |
+| **Total Time (2000 req)** | ~66s | ~9s |
+| **CPU Usage** | *** | **** |
+
+**Factors Affecting Performance:**
+- Network latency
+- Image size (for steganography endpoint)
+- Node health (unhealthy nodes slow down forwarding)
+- System resources (CPU, memory, network bandwidth)
+
+### Configuration Tuning
+
+**Client (Python):**
+```python
+TOTAL_REQUESTS = 10000  # Adjust total load
+NUM_THREADS = 20        # Increase for more concurrency
+MAX_RETRIES = 4         # More retries = fewer failures, slower
+TIMEOUT = 10            # Longer timeout = more resilient, slower
 ```
 
-### Node 3 (After Leader 1 Dies)
+**Server (Rust):**
+```rust
+worker_threads = 8      // Match CPU cores (or slightly more)
+heartbeat_interval = 300 // Raft heartbeat frequency (ms)
+election_timeout_min = 1500 // Min election timeout (ms)
+election_timeout_max = 2500 // Max election timeout (ms)
 ```
-📥 Vote request from leader term 3
-✅ Vote succeeded
-2025-10-30T21:30:04.805504Z  INFO become leader id=3
-📤 Sending append_entries to node 1 at 127.0.0.1:7001
-📤 Sending append_entries to node 2 at 127.0.0.1:7002
+
+### Monitoring During Test
+
+**Watch Server Logs:**
+- Request forwarding messages
+- Health status changes
+- Probation attempts
+- Error messages
+
+**Watch Client Output:**
+- Progress indicators
+- Final distribution statistics
+- Failure count and analysis
+
+**System Monitoring:**
+```bash
+# CPU usage
+top -p $(pgrep -f raft-openraft-demo)
+
+# Network traffic
+netstat -i
+
+# Process threads
+ps -eLf | grep raft-openraft-demo
 ```
 
-## Troubleshooting
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| "Connection refused" errors | Node not listening yet | Wait 1 second after startup |
-| Nodes stuck as "Learner" | Cluster not initialized | Run cluster init test |
-| Leader doesn't change | Election timeout too long | Check config (1500-3000ms) |
-| Nodes have different terms | Network partition (normal) | They'll resync when reconnected |
-
-## Next Steps
-
-1. **Add state machine** - Make cluster store actual data
-2. **Persistent storage** - Replace in-memory with RocksDB
-3. **Multi-server deployment** - Deploy to actual machines
-4. **Client API** - Add key-value operations
-5. **Monitoring** - Metrics, dashboards, alerts
-
-## References
-
-- **Raft Paper**: https://raft.github.io/raft.pdf
-- **OpenRaft**: https://github.com/datafusionlabs/openraft
-- **Visualization**: https://raft.github.io/raftscope/index.html
+---
 
 ## Summary
 
-You now have a **working 3-node Raft cluster** that:
-✅ Elects leaders automatically
-✅ Replicates logs consistently
-✅ Recovers from failures
-✅ Maintains cluster membership
+This architecture provides:
+- ✅ **High Throughput**: Multi-threaded client and server
+- ✅ **Resilience**: Health tracking, retries, probation
+- ✅ **Fair Distribution**: Random selection with health filtering
+- ✅ **Scalability**: Concurrent request handling, non-blocking I/O
+- ✅ **Simplicity**: Clear separation of concerns, straightforward logic
 
-This is production-grade consensus protocol! 🎉
-```
+The system demonstrates robust load balancing with automatic failure recovery and efficient concurrent processing.
 
