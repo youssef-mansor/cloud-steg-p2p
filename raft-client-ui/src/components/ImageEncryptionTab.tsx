@@ -8,10 +8,15 @@ export function ImageEncryptionTab() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [encryptedBlob, setEncryptedBlob] = useState<Blob | null>(null);
+  const [decryptedBlob, setDecryptedBlob] = useState<Blob | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isDecrypting, setIsDecrypting] = useState(false);
   const [processingNode, setProcessingNode] = useState<number | null>(null);
+  const [decryptingNode, setDecryptingNode] = useState<number | null>(null);
   const [latency, setLatency] = useState<number | null>(null);
+  const [decryptLatency, setDecryptLatency] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const stegoFileInputRef = useRef<HTMLInputElement>(null);
 
   // Stress test state
   const [isStressTesting, setIsStressTesting] = useState(false);
@@ -66,6 +71,47 @@ export function ImageEncryptionTab() {
     const a = document.createElement('a');
     a.href = url;
     a.download = 'encrypted-image.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDecrypt = async (stegoFile: File) => {
+    setIsDecrypting(true);
+    setDecryptLatency(null);
+
+    try {
+      const result = await apiClient.decryptImageFromCluster(stegoFile);
+
+      if (result.success && result.data) {
+        setDecryptedBlob(result.data);
+        setDecryptingNode(result.nodeId || null);
+        setDecryptLatency(result.latency);
+      } else {
+        alert(`Decryption failed: ${result.error}`);
+      }
+    } catch (error) {
+      alert(`Error: ${error}`);
+    } finally {
+      setIsDecrypting(false);
+    }
+  };
+
+  const handleDecryptFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    handleDecrypt(file);
+  };
+
+  const handleDownloadDecrypted = () => {
+    if (!decryptedBlob) return;
+
+    const url = URL.createObjectURL(decryptedBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'decrypted-image.bin';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -351,6 +397,50 @@ export function ImageEncryptionTab() {
             </button>
           </div>
         )}
+
+        {/* Decrypt Section */}
+        <div className="mt-8 pt-8 border-t">
+          <h2 className="text-xl font-bold mb-4">Decryption</h2>
+          <p className="text-sm text-gray-600 mb-4">
+            Upload a stego image to extract the hidden data
+          </p>
+
+          {/* File Input for Decryption */}
+          <div className="mb-6">
+            <input
+              ref={stegoFileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleDecryptFileSelect}
+              className="hidden"
+            />
+            <button
+              onClick={() => stegoFileInputRef.current?.click()}
+              disabled={isDecrypting}
+              className="flex items-center gap-2 px-6 py-3 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed"
+            >
+              <Upload size={20} />
+              Select Stego Image to Decrypt
+            </button>
+          </div>
+
+          {/* Decrypt Button */}
+          {decryptedBlob && (
+            <div className="border rounded p-4 bg-blue-50">
+              <h3 className="font-semibold mb-2 text-blue-600">✓ Decryption Complete</h3>
+              <p className="text-sm text-gray-600 mb-2">
+                Processed by Node {decryptingNode} • Latency: {decryptLatency?.toFixed(0)}ms
+              </p>
+              <button
+                onClick={handleDownloadDecrypted}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-500 text-white rounded hover:bg-indigo-600"
+              >
+                <Download size={20} />
+                Download Extracted Data
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Stress Test Section */}

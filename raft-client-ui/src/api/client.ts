@@ -124,6 +124,52 @@ export class RaftApiClient {
     };
   }
 
+  // Decrypt/Extract image from stego image
+  async decryptImageFromCluster(stegoFile: File): Promise<{
+    success: boolean;
+    data?: Blob;
+    error?: string;
+    nodeId?: number;
+    processedBy?: number;
+    latency: number;
+  }> {
+    const node = this.nodes[0];
+    if (!node) {
+      return { success: false, error: 'No nodes available', latency: 0 };
+    }
+
+    const startTime = performance.now();
+
+    try {
+      const arrayBuffer = await stegoFile.arrayBuffer();
+      console.log(`Decrypting stego image (${node.httpAddr}/image/decrypt), file size: ${arrayBuffer.byteLength} bytes`);
+      
+      const response = await fetch(`${node.httpAddr}/image/decrypt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: arrayBuffer,
+      });
+
+      const latency = performance.now() - startTime;
+
+      if (!response.ok) {
+        console.error(`Decryption failed: HTTP ${response.status}`);
+        return { success: false, error: `HTTP ${response.status}`, latency };
+      }
+
+      const processedByHeader = response.headers.get('X-Processed-By-Node');
+      const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : node.id;
+
+      const blob = await response.blob();
+      console.log(`Decryption succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${latency.toFixed(0)}ms`);
+      return { success: true, data: blob, latency, processedBy };
+    } catch (error) {
+      const latency = performance.now() - startTime;
+      console.error('Decryption error:', error);
+      return { success: false, error: String(error), latency };
+    }
+  }
+
   // Health check for a node
   async checkHealth(nodeId: number): Promise<boolean> {
     const node = this.nodes.find((n) => n.id === nodeId);

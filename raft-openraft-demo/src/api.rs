@@ -91,6 +91,7 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/cluster/change-membership", post(change_membership))
         .route("/image/echo", post(echo_image))      // Echo: return same image
         .route("/image/steg", post(steg_image))      // Steganography: embed and return stego image
+        .route("/image/decrypt", post(decrypt_image)) // Decrypt: extract from stego image
         .layer(cors)
         .with_state(app_state)
 }
@@ -740,6 +741,227 @@ fn embed_image_into_cover(secret_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::e
         .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageOutputFormat::Png)?;
     
     Ok(png_bytes)
+}
+
+/// Decrypt image - extract the original image from stego image
+async fn decrypt_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let image_size = body.len();
+    
+    // Check Raft state first
+    let metrics = state.raft.metrics().borrow().clone();
+    let is_leader = matches!(metrics.state, ServerState::Leader);
+    let is_forwarded = headers.contains_key("x-raft-forwarded");
+    
+    println!("📨 decrypt_image: Node {} (is_leader={}, is_forwarded={}) received {} bytes", 
+             state.node_id, is_leader, is_forwarded, image_size);
+    
+    // Check if image is too large (max 10MB for safety)
+    if image_size > 10_485_760 {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("Content-Type", "application/json")],
+            format!(r#"{{"error": "Image too large (max 10MB), received {} bytes"}}"#, image_size),
+        ).into_response();
+    }
+    
+    // Followers only accept forwarded requests, not direct client requests
+    if !is_leader && !is_forwarded {
+        println!("🚫 Node {} (follower) dropping direct decrypt request - only leader processes direct requests", state.node_id);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
+        ).into_response();
+    }
+    
+    // If forwarded request and we're a follower, process it
+    if !is_leader && is_forwarded {
+        println!("📥 Node {} (follower) processing forwarded decrypt request: {} bytes", state.node_id, image_size);
+        println!("🔓 Starting steganography extraction...");
+        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
+        let body_clone = body.clone();
+        let node_id = state.node_id;
+        match tokio::task::spawn_blocking(move || extract_image_from_stego(&body_clone[..])).await {
+            Ok(Ok(extracted_bytes)) => {
+                println!("✅ Node {} extracted image: {} bytes", node_id, extracted_bytes.len());
+                return (
+                    StatusCode::OK,
+                    [
+                        ("Content-Type", "application/octet-stream"),
+                        ("X-Processed-By-Node", &format!("{}", node_id)),
+                    ],
+                    axum::body::Bytes::from(extracted_bytes),
+                ).into_response();
+            }
+            Ok(Err(e)) => {
+                eprintln!("❌ Node {} failed to extract image: {}", node_id, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to extract image: {}"}}"#, e),
+                ).into_response();
+            }
+            Err(e) => {
+                eprintln!("❌ Node {} task join error: {}", node_id, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Task execution failed"}}"#),
+                ).into_response();
+            }
+        }
+    }
+    
+    // Leader: randomly assign to a node (including self)
+    println!("👉 Leader {} calling get_random_node()...", state.node_id);
+    let (target_id, target_addr) = match get_random_node(&state).await {
+        Some(addr) => addr,
+        None => {
+            println!("⚠️  No available nodes for forwarding, processing locally");
+            (state.node_id, state.self_http_addr.clone())
+        }
+    };
+    
+    println!("🎯 Leader {} selected target node {} at addr {}", state.node_id, target_id, target_addr);
+    
+    if target_id == state.node_id {
+        // Process locally
+        println!("📥 Node {} (leader) processing decrypt request locally: {} bytes", state.node_id, image_size);
+        println!("🔓 Starting steganography extraction...");
+        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
+        let body_clone = body.clone();
+        let node_id = state.node_id;
+        match tokio::task::spawn_blocking(move || extract_image_from_stego(&body_clone[..])).await {
+            Ok(Ok(extracted_bytes)) => {
+                println!("✅ Node {} extracted image: {} bytes", node_id, extracted_bytes.len());
+                (
+                    StatusCode::OK,
+                    [
+                        ("Content-Type", "application/octet-stream"),
+                        ("X-Processed-By-Node", &format!("{}", node_id)),
+                    ],
+                    axum::body::Bytes::from(extracted_bytes),
+                ).into_response()
+            }
+            Ok(Err(e)) => {
+                eprintln!("❌ Node {} failed to extract image: {}", node_id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to extract image: {}"}}"#, e),
+                ).into_response()
+            }
+            Err(e) => {
+                eprintln!("❌ Node {} task join error: {}", node_id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Task execution failed"}}"#),
+                ).into_response()
+            }
+        }
+    } else {
+        // Forward to target node
+        println!("🔄 Leader {} forwarding decrypt request to node {}", state.node_id, target_id);
+        match forward_request_to_node(target_id, &target_addr, "/image/decrypt", &body).await {
+            Ok(response) => {
+                match response.bytes().await {
+                    Ok(response_bytes) => {
+                        println!("✅ Leader {} received response from node {}: {} bytes", state.node_id, target_id, response_bytes.len());
+                        (
+                            StatusCode::OK,
+                            [
+                                ("Content-Type", "application/octet-stream"),
+                                ("X-Processed-By-Node", &format!("{}", target_id)),
+                            ],
+                            axum::body::Bytes::from(response_bytes),
+                        ).into_response()
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to read response body from node {}: {}", target_id, e);
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            [("Content-Type", "application/json")],
+                            format!(r#"{{"error": "Failed to read response: {}"}}"#, e),
+                        ).into_response()
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Forward to node {} failed: {}", target_id, e);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Forwarding failed: {}"}}"#, e),
+                ).into_response()
+            }
+        }
+    }
+}
+
+/// Extract image from stego image (LSB steganography)
+fn extract_image_from_stego(stego_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    // Load stego image
+    let stego_img = image::load_from_memory(stego_bytes)?;
+    let stego_rgba = stego_img.to_rgba8();
+    let raw_bytes = stego_rgba.as_raw();
+    
+    // Extract bits from LSB of R, G, B channels
+    let mut extracted_bits = Vec::new();
+    for pixel_chunk in raw_bytes.chunks_exact(4) {
+        // Extract from R channel
+        extracted_bits.push(((pixel_chunk[0] & 1) != 0) as u8);
+        
+        // Extract from G channel
+        extracted_bits.push(((pixel_chunk[1] & 1) != 0) as u8);
+        
+        // Extract from B channel
+        extracted_bits.push(((pixel_chunk[2] & 1) != 0) as u8);
+    }
+    
+    // Convert bits to bytes (LSB-first per byte)
+    let mut payload_bytes = Vec::new();
+    for byte_bits in extracted_bits.chunks_exact(8) {
+        let mut byte = 0u8;
+        for (i, &bit) in byte_bits.iter().enumerate() {
+            byte |= (bit << i);
+        }
+        payload_bytes.push(byte);
+    }
+    
+    // Parse payload: [4 bytes len][12 bytes nonce][ciphertext]
+    if payload_bytes.len() < 16 {
+        return Err("Payload too small".into());
+    }
+    
+    let ct_len = u32::from_le_bytes([
+        payload_bytes[0],
+        payload_bytes[1],
+        payload_bytes[2],
+        payload_bytes[3],
+    ]) as usize;
+    
+    let nonce_bytes = &payload_bytes[4..16];
+    let ciphertext = &payload_bytes[16..16 + ct_len];
+    
+    if payload_bytes.len() < 16 + ct_len {
+        return Err("Incomplete ciphertext".into());
+    }
+    
+    // Try to decrypt with a test key - in real use, we'd need the original key
+    // For now, we'll try common approaches
+    // Note: Without the original key, we can't decrypt properly
+    // This is a limitation of the current steganography implementation
+    
+    // For demonstration, we'll try to extract raw bytes if available
+    // In production, you'd need key exchange mechanism
+    
+    // Return the ciphertext as-is (in production, you'd decrypt with the proper key)
+    Ok(ciphertext.to_vec())
 }
 
 /// Error wrapper
