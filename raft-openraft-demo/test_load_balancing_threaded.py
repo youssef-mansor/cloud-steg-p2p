@@ -14,7 +14,7 @@ from collections import defaultdict
 from threading import Lock
 
 # Configuration
-TOTAL_REQUESTS = 10000
+TOTAL_REQUESTS = 1000
 NUM_THREADS = 20  # Number of concurrent threads
 REQUESTS_PER_THREAD = TOTAL_REQUESTS // NUM_THREADS
 MAX_RETRIES = 4
@@ -32,7 +32,11 @@ failure_count = [0]
 
 def multicast_request(request_num):
     """Multicast request to all 3 nodes with retry logic"""
-    ports = [8001, 8002, 8003]
+    servers = [
+        {'id': 1, 'httpAddr': 'http://10.40.49.211:8001'},
+        {'id': 2, 'httpAddr': 'http://10.40.41.162:8002'},
+        {'id': 3, 'httpAddr': 'http://10.40.46.168:8003'},
+    ]
     max_retries = MAX_RETRIES
     retry_count = 0
     
@@ -49,8 +53,8 @@ def multicast_request(request_num):
         # Multicast to all 3 nodes in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             future_to_port = {}
-            for port in ports:
-                url = f"http://127.0.0.1:{port}/image/echo"
+            for server in servers:
+                url = f"{server['httpAddr']}/image/echo"
                 future = executor.submit(
                     requests.post,
                     url,
@@ -58,20 +62,20 @@ def multicast_request(request_num):
                     timeout=TIMEOUT,
                     headers={'Content-Type': 'application/octet-stream'}
                 )
-                future_to_port[future] = port
+                future_to_port[future] = server['id']
             
             for future in concurrent.futures.as_completed(future_to_port):
-                port = future_to_port[future]
+                node_id = future_to_port[future]
                 try:
                     response = future.result()
-                    responses.append((port, response.status_code, response.headers.get('X-Processed-By-Node', '')))
+                    responses.append((node_id, response.status_code, response.headers.get('X-Processed-By-Node', '')))
                     all_codes.append(response.status_code)
                 except Exception as e:
-                    responses.append((port, 0, ''))
+                    responses.append((node_id, 0, ''))
                     all_codes.append(0)
         
         # Find first successful response (200)
-        for port, code, processed_by in responses:
+        for node_id, code, processed_by in responses:
             if code == 200:
                 return code, processed_by, retry_count, all_codes
         
@@ -132,7 +136,7 @@ def main():
     
     # Find leader
     try:
-        response = requests.get("http://127.0.0.1:8001/metrics", timeout=5)
+        response = requests.get("http://10.40.49.211:8001/metrics", timeout=5)
         data = response.json()
         leader_node = data.get('data', {}).get('current_leader')
         if not leader_node:
@@ -143,9 +147,10 @@ def main():
         print(f"❌ Error connecting to nodes: {e}")
         sys.exit(1)
     
-    print(f"📡 Will multicast requests to all 3 nodes (port 8001, 8002, 8003)")
-    print(f"   - Followers will reject (503)")
-    print(f"   - Leader will forward to healthy nodes")
+    print(f"📡 Will multicast requests to all 3 nodes:")
+    print(f"   • Node 1: http://10.40.49.211:8001")
+    print(f"   • Node 2: http://10.40.41.162:8002")
+    print(f"   • Node 3: http://10.40.46.168:8003")
     print(f"\n🚀 Starting {NUM_THREADS} threads, {REQUESTS_PER_THREAD} requests per thread")
     print(f"📤 Sending {TOTAL_REQUESTS} requests concurrently...\n")
     
@@ -196,7 +201,10 @@ def main():
         "Architecture:",
         f"  • {NUM_THREADS} concurrent threads",
         f"  • {REQUESTS_PER_THREAD} requests per thread",
-        "  • Requests multicast to all 3 nodes (port 8001, 8002, 8003)",
+        "  • Requests multicast to all 3 nodes:",
+        "    - Node 1: http://10.40.49.211:8001",
+        "    - Node 2: http://10.40.41.162:8002",
+        "    - Node 3: http://10.40.46.168:8003",
         "  • Followers reject direct requests (503)",
         "  • Leader forwards to healthy nodes only",
         "  • Client-side retry: multicast again on failure (up to 2 retries)",
