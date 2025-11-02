@@ -19,7 +19,7 @@ export class RaftApiClient {
     this.nodes = nodes;
   }
 
-  // Get metrics from a specific node
+  // Get metrics from a specific node with timeout
   async getMetrics(nodeId: number): Promise<ApiResponse<NodeMetrics>> {
     const node = this.nodes.find((n) => n.id === nodeId);
     if (!node) {
@@ -27,10 +27,16 @@ export class RaftApiClient {
     }
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+      
       const response = await fetch(`${node.httpAddr}/metrics`, {
         method: 'GET',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
       });
+
+      clearTimeout(timeoutId);
 
       if (!response.ok) {
         return { success: false, error: `HTTP ${response.status}` };
@@ -43,17 +49,37 @@ export class RaftApiClient {
     }
   }
 
-  // Get metrics from all nodes
+  // Get metrics from all nodes with timeout
   async getAllMetrics(): Promise<Map<number, ApiResponse<NodeMetrics>>> {
     const results = new Map<number, ApiResponse<NodeMetrics>>();
     
-    await Promise.all(
-      this.nodes.map(async (node) => {
-        const metrics = await this.getMetrics(node.id);
-        results.set(node.id, metrics);
-      })
-    );
+    // Use Promise.allSettled to ensure all requests complete, even if some fail
+    // Add a timeout to individual requests to prevent hanging
+    const metricsPromises = this.nodes.map(async (node) => {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout per node
+        
+        const response = await fetch(`${node.httpAddr}/metrics`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          results.set(node.id, { success: false, error: `HTTP ${response.status}` });
+        } else {
+          const data = await response.json();
+          results.set(node.id, data);
+        }
+      } catch (error) {
+        results.set(node.id, { success: false, error: String(error) });
+      }
+    });
 
+    await Promise.allSettled(metricsPromises);
     return results;
   }
 
@@ -73,12 +99,17 @@ export class RaftApiClient {
       const arrayBuffer = await imageFile.arrayBuffer();
       console.log(`Uploading to node ${nodeId} (${node.httpAddr}/image/steg), file size: ${arrayBuffer.byteLength} bytes`);
       
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout for image upload
+      
       const response = await fetch(`${node.httpAddr}/image/steg`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: arrayBuffer,
+        signal: controller.signal,
       });
 
+      clearTimeout(timeoutId);
       const latency = performance.now() - startTime;
 
       if (!response.ok) {
@@ -118,6 +149,36 @@ export class RaftApiClient {
     }
   }
 
+  // Find the actual leader node
+  private async findLeader(): Promise<number | null> {
+    console.log('🔍 Detecting leader...');
+    
+    // Try each node to find who reports as the leader
+    for (const node of this.nodes) {
+      try {
+        const metricsResult = await this.getMetrics(node.id);
+        if (metricsResult.success && metricsResult.data) {
+          const reportedLeaderId = metricsResult.data.current_leader;
+          const isLeader = metricsResult.data.state === 'Leader';
+          
+          console.log(`  Node ${node.id}: state=${metricsResult.data.state}, reports leader=${reportedLeaderId}`);
+          
+          // If this node reports itself as leader, verify it
+          if (isLeader && reportedLeaderId === node.id) {
+            console.log(`✅ Confirmed leader: Node ${node.id}`);
+            return node.id;
+          }
+        }
+      } catch (error) {
+        console.log(`  Node ${node.id}: unreachable`);
+        continue;
+      }
+    }
+    
+    console.log('⚠️  Could not detect leader from any node');
+    return null;
+  }
+
   // Send image to any available node (load balanced)
   async uploadImageToCluster(imageFile: File): Promise<{
     success: boolean;
@@ -128,8 +189,22 @@ export class RaftApiClient {
     processedBy?: number;
     latency: number;
   }> {
-    // Try each node until one succeeds (finds the leader)
+    // Find the leader
+    const leaderId = await this.findLeader();
+
+    if (leaderId) {
+      console.log(`📤 Sending encryption request to leader Node ${leaderId}`);
+      const result = await this.uploadImageForEncryption(leaderId, imageFile);
+      if (result.success) {
+        return { ...result, nodeId: leaderId };
+      }
+      console.error(`❌ Leader Node ${leaderId} failed, trying other nodes...`);
+    }
+
+    // Fallback: try all nodes if leader is down or detection failed
+    console.log('⚠️  Trying all nodes as fallback...');
     for (const node of this.nodes) {
+      if (node.id === leaderId) continue; // Skip leader if we already tried it
       const result = await this.uploadImageForEncryption(node.id, imageFile);
       if (result.success) {
         return { ...result, nodeId: node.id };
@@ -143,7 +218,7 @@ export class RaftApiClient {
     };
   }
 
-  // Decrypt/Extract image from stego image (with multicast to all nodes)
+  // Decrypt/Extract image from stego image - send to leader for load balancing
   async decryptImageFromCluster(stegoFile: File, encryptionKey: string): Promise<{
     success: boolean;
     data?: Blob;
@@ -157,52 +232,106 @@ export class RaftApiClient {
     try {
       const arrayBuffer = await stegoFile.arrayBuffer();
       
-      // Longer timeout for large files (30 seconds instead of default fetch timeout)
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      // Find the leader
+      const leaderId = await this.findLeader();
+
+      if (leaderId) {
+        console.log(`📤 Sending decryption request to leader Node ${leaderId}`);
+        const leaderNode = this.nodes.find((n) => n.id === leaderId);
+        if (leaderNode) {
+          const nodeStartTime = performance.now();
+          const nodeController = new AbortController();
+          const nodeTimeoutId = setTimeout(() => nodeController.abort(), 30000); // 30 second timeout
+          
+          try {
+            const response = await fetch(
+              `${leaderNode.httpAddr}/image/decrypt?key=${encodeURIComponent(encryptionKey)}`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/octet-stream' },
+                body: arrayBuffer,
+                signal: nodeController.signal,
+              }
+            );
+
+            clearTimeout(nodeTimeoutId);
+            const nodeLatency = performance.now() - nodeStartTime;
+
+            if (response.ok) {
+              const processedByHeader = response.headers.get('X-Processed-By-Node');
+              const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : leaderId;
+
+              const arrayBufferResponse = await response.arrayBuffer();
+              const blob = new Blob([arrayBufferResponse], { type: 'image/png' });
+              console.log(`✅ Leader Node ${leaderId} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${nodeLatency.toFixed(0)}ms`);
+              
+              const totalLatency = performance.now() - startTime;
+              return { 
+                success: true, 
+                data: blob, 
+                nodeId: leaderId,
+                processedBy, 
+                latency: totalLatency 
+              };
+            }
+          } catch (error) {
+            clearTimeout(nodeTimeoutId);
+            console.error(`❌ Leader Node ${leaderId} failed:`, error);
+          }
+        }
+      }
+
+      // Fallback: try all nodes if leader detection failed or leader is down
+      console.log('⚠️  Leader detection failed or leader is down, trying all nodes');
       
-      // Try each node (multicast pattern like encryption)
       const results = await Promise.allSettled(
         this.nodes.map(async (node) => {
           console.log(`Attempting decryption on node ${node.id} (${node.httpAddr}/image/decrypt?key=${encryptionKey}), file size: ${arrayBuffer.byteLength} bytes`);
           
           const nodeStartTime = performance.now();
-          const response = await fetch(
-            `${node.httpAddr}/image/decrypt?key=${encodeURIComponent(encryptionKey)}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/octet-stream' },
-              body: arrayBuffer,
-              signal: controller.signal,
-            }
-          );
-
-          const nodeLatency = performance.now() - nodeStartTime;
-
-          if (!response.ok) {
-            console.error(`Node ${node.id} returned HTTP ${response.status}`);
-            throw new Error(`HTTP ${response.status}`);
-          }
-
-          const processedByHeader = response.headers.get('X-Processed-By-Node');
-          const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : node.id;
-
-          // Get the raw bytes and create a blob with image/png type
-          const arrayBufferResponse = await response.arrayBuffer();
-          const blob = new Blob([arrayBufferResponse], { type: 'image/png' });
-          console.log(`✅ Node ${node.id} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${nodeLatency.toFixed(0)}ms`);
+          const nodeController = new AbortController();
+          const nodeTimeoutId = setTimeout(() => nodeController.abort(), 30000); // 30 second timeout per node
           
-          return { 
-            success: true, 
-            data: blob, 
-            nodeId: node.id,
-            processedBy, 
-            latency: nodeLatency 
-          };
+          try {
+            const response = await fetch(
+              `${node.httpAddr}/image/decrypt?key=${encodeURIComponent(encryptionKey)}`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/octet-stream' },
+                body: arrayBuffer,
+                signal: nodeController.signal,
+              }
+            );
+
+            clearTimeout(nodeTimeoutId);
+            const nodeLatency = performance.now() - nodeStartTime;
+
+            if (!response.ok) {
+              console.error(`Node ${node.id} returned HTTP ${response.status}`);
+              throw new Error(`HTTP ${response.status}`);
+            }
+
+            const processedByHeader = response.headers.get('X-Processed-By-Node');
+            const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : node.id;
+
+            // Get the raw bytes and create a blob with image/png type
+            const arrayBufferResponse = await response.arrayBuffer();
+            const blob = new Blob([arrayBufferResponse], { type: 'image/png' });
+            console.log(`✅ Node ${node.id} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${nodeLatency.toFixed(0)}ms`);
+            
+            return { 
+              success: true, 
+              data: blob, 
+              nodeId: node.id,
+              processedBy, 
+              latency: nodeLatency 
+            };
+          } catch (error) {
+            clearTimeout(nodeTimeoutId);
+            throw error;
+          }
         })
       );
-
-      clearTimeout(timeoutId);
 
       // Find first successful result
       for (const result of results) {
