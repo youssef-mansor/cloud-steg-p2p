@@ -29,6 +29,7 @@ export function ImageEncryptionTab() {
   const [latencyTimeSeries, setLatencyTimeSeries] = useState<TimeSeriesDataPoint[]>([]);
   const [enableFailureTests, setEnableFailureTests] = useState(false);
   const [failureEvents, setFailureEvents] = useState<Array<{ time: number; node: number; event: string; requestNum: number }>>([]);
+  const [stressTestDuration, setStressTestDuration] = useState<number | null>(null);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -144,24 +145,26 @@ export function ImageEncryptionTab() {
 
     setIsStressTesting(true);
     setStressTestProgress(0);
-    setStressTestStats([]); // Clear previous stats
-    setThroughputTimeSeries([]); // Clear previous throughput data
-    setLatencyTimeSeries([]); // Clear previous latency data
-    setFailureEvents([]); // Clear previous failure events
+    setStressTestStats([]);
+    setThroughputTimeSeries([]);
+    setLatencyTimeSeries([]);
+    setFailureEvents([]);
+    setStressTestDuration(null);
+
+    const startTime = Date.now();
 
     const stats = new Map<number, { 
       success: number; 
       failure: number; 
       totalLatency: number;
-      requestTimestamps: number[]; // Track when each request completed
-      latencyTimestamps: Array<{ timestamp: number; latency: number }>; // Track latency at each timestamp
+      requestTimestamps: number[];
+      latencyTimestamps: Array<{ timestamp: number; latency: number }>;
     }>();
     apiClient.getNodes().forEach((node) => {
       stats.set(node.id, { success: 0, failure: 0, totalLatency: 0, requestTimestamps: [], latencyTimestamps: [] });
     });
 
-    const startTime = Date.now();
-    const requestsPerThread = stressTestTotal; // stressTestTotal is now requests per thread
+    const requestsPerThread = stressTestTotal;
     let completedRequests = 0;
     
     // Failure testing configuration - all nodes can fail, but at least 1 must be up
@@ -421,6 +424,10 @@ export function ImageEncryptionTab() {
         node3: node3AvgLatency,
       });
     }
+    
+    const endTime = Date.now();
+    const duration = (endTime - startTime) / 1000;
+    setStressTestDuration(duration);
     
     setThroughputTimeSeries(timeSeries);
     setLatencyTimeSeries(latencyTimeSeries);
@@ -707,7 +714,7 @@ export function ImageEncryptionTab() {
             
             {/* Test Summary */}
             <div className="bg-blue-50 border border-blue-200 rounded p-4 mb-4">
-              <div className="grid grid-cols-3 gap-4 mb-3">
+              <div className="grid grid-cols-4 gap-4 mb-3">
                 <div>
                   <p className="text-sm text-gray-600">Total Requests Sent</p>
                   <p className="text-2xl font-bold text-blue-600">{stressTestTotal * stressTestThreads}</p>
@@ -729,6 +736,12 @@ export function ImageEncryptionTab() {
                         ).toFixed(1)
                       : '0'}
                     %
+                  </p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-600">Total Time</p>
+                  <p className="text-2xl font-bold text-purple-600">
+                    {stressTestDuration !== null ? `${stressTestDuration.toFixed(2)}s` : '-'}
                   </p>
                 </div>
               </div>
