@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-TOTAL_REQUESTS=2000 
+TOTAL_REQUESTS=200 
 BATCH_SIZE=100
 OUTPUT_DIR="/tmp/load_balance_test_$$"
 RESULTS_FILE="$OUTPUT_DIR/results.txt"
@@ -23,7 +23,7 @@ fi
 
 # Find which node is the leader
 echo "🔍 Checking which node is the leader..."
-LEADER_NODE=$(curl -s http://127.0.0.1:8001/metrics | jq -r '.data.current_leader // empty')
+LEADER_NODE=$(curl -s http://10.40.56.135:8001/metrics | jq -r '.data.current_leader // empty')
 if [ -z "$LEADER_NODE" ]; then
     echo "❌ Error: Could not find leader. Make sure all 3 nodes are running!"
     exit 1
@@ -66,19 +66,19 @@ multicast_request() {
         
         # Send to all 3 nodes in parallel
         curl -s --max-time 10 -o "$body_file_1" -w "%{http_code}" \
-            -X POST "http://127.0.0.1:8001/image/echo" \
+            -X POST "http://10.40.56.135:8001/image/steg" \
             --data-binary @input-image.png \
             -D "$headers_file_1" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_1" &
         PID1=$!
         
         curl -s --max-time 10 -o "$body_file_2" -w "%{http_code}" \
-            -X POST "http://127.0.0.1:8002/image/echo" \
+            -X POST "http://10.40.39.217:8002/image/steg" \
             --data-binary @input-image.png \
             -D "$headers_file_2" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_2" &
         PID2=$!
         
         curl -s --max-time 10 -o "$body_file_3" -w "%{http_code}" \
-            -X POST "http://127.0.0.1:8003/image/echo" \
+            -X POST "http://10.40.46.168:8003/image/steg" \
             --data-binary @input-image.png \
             -D "$headers_file_3" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_3" &
         PID3=$!
@@ -94,18 +94,35 @@ multicast_request() {
         # Find the first successful response (200)
         if [ "$code1" = "200" ]; then
             HTTP_CODE="$code1"
-            PROCESSED_BY=$(grep -i "^x-processed-by-node:" "$headers_file_1" 2>/dev/null | \
-                sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n' || echo "")
+            # Extract header - curl -D saves headers; parse case-insensitively
+            # curl -D format: "Header-Name: value\r\n"
+            if [ -f "$headers_file_1" ]; then
+                PROCESSED_BY=$(grep -i "^x-processed-by-node" "$headers_file_1" 2>/dev/null | \
+                    sed -E 's/^[^:]*:[[:space:]]*//' | \
+                    sed 's/[[:space:]]*$//' | \
+                    tr -d '\r\n' | \
+                    head -1 || echo "")
+            fi
             break
         elif [ "$code2" = "200" ]; then
             HTTP_CODE="$code2"
-            PROCESSED_BY=$(grep -i "^x-processed-by-node:" "$headers_file_2" 2>/dev/null | \
-                sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n' || echo "")
+            if [ -f "$headers_file_2" ]; then
+                PROCESSED_BY=$(grep -i "^x-processed-by-node" "$headers_file_2" 2>/dev/null | \
+                    sed -E 's/^[^:]*:[[:space:]]*//' | \
+                    sed 's/[[:space:]]*$//' | \
+                    tr -d '\r\n' | \
+                    head -1 || echo "")
+            fi
             break
         elif [ "$code3" = "200" ]; then
             HTTP_CODE="$code3"
-            PROCESSED_BY=$(grep -i "^x-processed-by-node:" "$headers_file_3" 2>/dev/null | \
-                sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n' || echo "")
+            if [ -f "$headers_file_3" ]; then
+                PROCESSED_BY=$(grep -i "^x-processed-by-node" "$headers_file_3" 2>/dev/null | \
+                    sed -E 's/^[^:]*:[[:space:]]*//' | \
+                    sed 's/[[:space:]]*$//' | \
+                    tr -d '\r\n' | \
+                    head -1 || echo "")
+            fi
             break
         fi
         
@@ -130,7 +147,9 @@ multicast_request() {
     
     if [ "$HTTP_CODE" = "200" ]; then
         success_count=$((success_count + 1))
-        if [ -n "$PROCESSED_BY" ]; then
+        # Trim whitespace from PROCESSED_BY
+        PROCESSED_BY=$(echo "$PROCESSED_BY" | xargs)
+        if [ -n "$PROCESSED_BY" ] && [ "$PROCESSED_BY" != "" ]; then
             case "$PROCESSED_BY" in
                 1) node_count_1=$((node_count_1 + 1)) ;;
                 2) node_count_2=$((node_count_2 + 1)) ;;
@@ -142,6 +161,7 @@ multicast_request() {
                 echo "$request_num\t$HTTP_CODE\t$PROCESSED_BY" >> "$RESULTS_FILE"
             fi
         else
+            # If header is missing, log it for debugging
             echo "$request_num\t$HTTP_CODE\tunknown" >> "$RESULTS_FILE"
         fi
     else

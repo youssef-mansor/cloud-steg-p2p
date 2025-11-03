@@ -409,7 +409,10 @@ async fn steg_image(
                          node_id, stego_bytes.len(), image_size);
                 return (
                     StatusCode::OK,
-                    [("Content-Type", "image/png")],
+                    [
+                        ("Content-Type", "image/png"),
+                        ("X-Processed-By-Node", &format!("{}", node_id)),
+                    ],
                     axum::body::Bytes::from(stego_bytes),
                 ).into_response();
             }
@@ -455,7 +458,10 @@ async fn steg_image(
                          node_id, stego_bytes.len(), image_size);
                 (
                     StatusCode::OK,
-                    [("Content-Type", "image/png")],
+                    [
+                        ("Content-Type", "image/png"),
+                        ("X-Processed-By-Node", &format!("{}", node_id)),
+                    ],
                     axum::body::Bytes::from(stego_bytes),
                 ).into_response()
             }
@@ -483,6 +489,13 @@ async fn steg_image(
                 state.node_id, target_id, target_addr);
         match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
             Ok(response) => {
+                // Extract X-Processed-By-Node header from forwarded response
+                let processed_by = response.headers()
+                    .get("x-processed-by-node")
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or_else(|| &format!("{}", target_id))
+                    .to_string();
+                
                 match response.bytes().await {
                     Ok(bytes) => {
                         println!("✅ Received stego image from node {}: {} bytes", target_id, bytes.len());
@@ -491,11 +504,10 @@ async fn steg_image(
                         healthy.insert(target_id, true);
                         drop(healthy);
                         
-                        (
-                            StatusCode::OK,
-                            [("Content-Type", "image/png")],
-                            bytes,
-                        ).into_response()
+                        let mut headers = HeaderMap::new();
+                        headers.insert("Content-Type", "image/png".parse().unwrap());
+                        headers.insert("X-Processed-By-Node", processed_by.parse().unwrap());
+                        (StatusCode::OK, headers, bytes).into_response()
                     }
                     Err(e) => {
                         eprintln!("❌ Failed to read response from node {}: {}", target_id, e);
