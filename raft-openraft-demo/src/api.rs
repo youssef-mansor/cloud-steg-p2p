@@ -5,6 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{Engine as _, engine::general_purpose};
 use chacha20poly1305::{aead::Aead, aead::KeyInit, ChaCha20Poly1305, Key, Nonce};
 use hex;
 use openraft::{Raft, RaftMetrics, ServerState};
@@ -598,7 +599,7 @@ async fn echo_image(
 #[derive(Debug, Serialize)]
 pub struct SteganographyResponse {
     pub key: String,  // Encryption key in hex format
-    pub image: Vec<u8>,  // Stego image in PNG format
+    pub image: String,  // Stego image in base64 format
 }
 
 // Similarly modify steg_image and decrypt_image functions:
@@ -845,10 +846,11 @@ async fn steg_image(
     
     // Return stego image and key in hex format
     let key_hex = hex::encode(&key);
+    let image_base64 = general_purpose::STANDARD.encode(&png_bytes);
     
     let response = SteganographyResponse {
         key: key_hex,
-        image: png_bytes,
+        image: image_base64,
     };
     
     return (StatusCode::OK, axum::Json(response)).into_response();
