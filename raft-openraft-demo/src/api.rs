@@ -687,12 +687,36 @@ async fn steg_image(
                     drop(throughput);
                     
                     println!("✅ Forwarded to node {} succeeded ({}ms)", target_id, elapsed_ms);
-                    return response;
+                    // Convert reqwest::Response to axum::Response
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    match response.bytes().await {
+                        Ok(body_bytes) => {
+                            let mut axum_response = axum::response::Response::new(axum::body::Body::from(body_bytes.to_vec()));
+                            *axum_response.status_mut() = axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(axum::http::StatusCode::OK);
+                            for (k, v) in headers.iter() {
+                                if let Ok(header_name) = axum::http::HeaderName::from_bytes(k.as_str().as_bytes()) {
+                                    if let Ok(header_value) = axum::http::HeaderValue::from_bytes(v.as_bytes()) {
+                                        axum_response.headers_mut().insert(header_name, header_value);
+                                    }
+                                }
+                            }
+                            return axum_response.into_response();
+                        }
+                        Err(e) => {
+                            println!("❌ Failed to read response body: {}", e);
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                [("Content-Type", "application/json")],
+                                format!(r#"{{"error": "Failed to read response from node {}"}}"#, target_id),
+                            ).into_response();
+                        }
+                    }
                 }
                 Err(e) => {
                     println!("❌ Forwarding to node {} failed: {}, falling back to local processing", target_id, e);
                     // Mark node as unhealthy
-                    let mut healthy = state.healthy.write().await;
+                    let mut healthy = state.healthy_nodes.write().await;
                     healthy.insert(target_id, false);
                     drop(healthy);
                     // Fall through to process locally as fallback
@@ -706,202 +730,29 @@ async fn steg_image(
     // - Single-node mode with direct request  
     // - Follower receiving forwarded request
     if (is_leader && !is_forwarded) || (is_single_node && !is_forwarded) || (!can_process && is_forwarded) {
-        Some(addr) => addr,
-        None => {
-            println!("⚠️  No available nodes for forwarding, processing locally");
-            (state.node_id, state.self_http_addr.clone())
-        }
-    };
-    
-    println!("🎯 Leader {} selected target node {} at addr {}", state.node_id, target_id, target_addr);
-    
-    if target_id == state.node_id {
-        // Process locally with latency tracking
-        println!("📥 Node {} (leader) processing steg request locally: {} bytes", state.node_id, image_size);
-        println!("🔐 Starting steganography embedding...");
-        println!("🔒 Encrypting and embedding image...");
-        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
-        let body_clone = body.clone();
-        let node_id = state.node_id;
-        let state_clone = state.clone();
+        // Generate random 32-byte key and 12-byte nonce for encryption
+        let mut key_bytes = [0u8; 32];
+        let mut nonce_bytes = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut key_bytes);
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
         
-        match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
-            Ok(Ok((stego_bytes, key_hex))) => {
-                // Measure TOTAL latency from HTTP receive to response send (what the client experiences)
-                let total_elapsed_ms = request_start.elapsed().as_millis() as u64;
-                println!("✅ Node {} created stego image: {} bytes (original: {} bytes) (total latency: {}ms)", 
-                         node_id, stego_bytes.len(), image_size, total_elapsed_ms);
-                println!("🔑 Encryption key: {}", key_hex);
-                
-                // Record TOTAL latency (including all overhead like HTTP, selection, etc.)
-                // This ensures fair comparison with forwarded requests
-                let mut latencies = state_clone.node_latencies.write().await;
-                let stats = latencies.entry(node_id).or_insert(LatencyStats {
-                    total_ms: 0,
-                    count: 0,
-                });
-                stats.total_ms += total_elapsed_ms;
-                stats.count += 1;
-                drop(latencies);
-                
-                // Increment successful request counter for throughput tracking
-                let mut throughput = state_clone.node_throughput.write().await;
-                let tp_stats = throughput.entry(node_id).or_insert(ThroughputStats {
-                    completed_requests: 0,
-                    throughput_req_per_sec: 0.0,
-                });
-                tp_stats.completed_requests += 1;
-                drop(throughput);
-                
-                // Encode image as base64
-                let image_base64 = format!("data:image/png;base64,{}", base64_encode(&stego_bytes));
-                
-                (
-                    StatusCode::OK,
-                    [
-                        ("Content-Type", "application/json"),
-                        ("X-Processed-By-Node", &format!("{}", node_id)),
-                    ],
-                    axum::body::Body::from(
-                        format!(r#"{{"key": "{}", "image": "{}"}}"#, key_hex, image_base64)
-                    ),
-                ).into_response()
-            }
-            Ok(Err(e)) => {
-                eprintln!("❌ Node {} failed to embed image: {}", node_id, e);
-                eprintln!("   Error details: {:?}", e);
-                (
+        let key = key_bytes;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        // Encrypt the image bytes
+        let secret_bytes = &body[..];
+        let ciphertext = match cipher.encrypt(nonce, secret_bytes) {
+            Ok(ct) => ct,
+            Err(e) => {
+                return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
-                ).into_response()
+                    format!(r#"{{"error": "Encryption failed: {}"}}"#, e),
+                ).into_response();
             }
-            Err(e) => {
-                eprintln!("❌ Node {} task join error: {}", node_id, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Task execution failed"}}"#),
-                ).into_response()
-            }
-        }
-    } else {
-        // Forward to selected node with retry logic and latency tracking
-        println!("🔄 Node {} (leader) forwarding steg request to node {} at {}", 
-                state.node_id, target_id, target_addr);
-        match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
-            Ok(response) => {
-                match response.bytes().await {
-                    Ok(bytes) => {
-                        // Measure TOTAL latency from HTTP receive to response send (includes all overhead)
-                        let total_elapsed_ms = request_start.elapsed().as_millis() as u64;
-                        println!("✅ Received stego image from node {}: {} bytes (total latency: {}ms)", 
-                                target_id, bytes.len(), total_elapsed_ms);
-                        
-                        // Record TOTAL latency for fair comparison with local processing
-                        let mut latencies = state.node_latencies.write().await;
-                        let stats = latencies.entry(target_id).or_insert(LatencyStats {
-                            total_ms: 0,
-                            count: 0,
-                        });
-                        stats.total_ms += total_elapsed_ms;
-                        stats.count += 1;
-                        drop(latencies);
-                        
-                        // Increment successful request counter for throughput tracking
-                        let mut throughput = state.node_throughput.write().await;
-                        let tp_stats = throughput.entry(target_id).or_insert(ThroughputStats {
-                            completed_requests: 0,
-                            throughput_req_per_sec: 0.0,
-                        });
-                        tp_stats.completed_requests += 1;
-                        drop(throughput);
-                        
-                        // Mark node as healthy on successful response
-                        let mut healthy = state.healthy_nodes.write().await;
-                        healthy.insert(target_id, true);
-                        drop(healthy);
-                        
-                        // Forward the response from the target node, preserving Content-Type
-                        // and adding X-Processed-By-Node header to track which node did the work
-                        let mut headers = HeaderMap::new();
-                        headers.insert("Content-Type", "application/json".parse().unwrap());
-                        headers.insert("X-Processed-By-Node", format!("{}", target_id).parse().unwrap());
-                        (StatusCode::OK, headers, bytes).into_response()
-                    }
-                    Err(e) => {
-                        let total_elapsed_ms = request_start.elapsed().as_millis() as u64;
-                        eprintln!("❌ Failed to read response from node {}: {} (total latency: {}ms)", target_id, e, total_elapsed_ms);
-                        
-                        // Record latency (slow failures matter too!)
-                        let mut latencies = state.node_latencies.write().await;
-                        let stats = latencies.entry(target_id).or_insert(LatencyStats {
-                            total_ms: 0,
-                            count: 0,
-                        });
-                        stats.total_ms += total_elapsed_ms;
-                        stats.count += 1;
-                        drop(latencies);
-                        
-                        // Mark node as unhealthy
-                        let mut healthy = state.healthy_nodes.write().await;
-                        healthy.insert(target_id, false);
-                        drop(healthy);
-                        
-                        // Return error - client should retry
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            [("Content-Type", "application/json")],
-                            format!(r#"{{"error": "Failed to read response from node {}"}}"#, target_id),
-                        ).into_response()
-                    }
-                }
-            }
-            Err(e) => {
-                let total_elapsed_ms = request_start.elapsed().as_millis() as u64;
-                eprintln!("❌ Failed to forward to node {}: {} (total latency: {}ms) - marking as unhealthy", target_id, e, total_elapsed_ms);
-                
-                // Record latency even on failure
-                let mut latencies = state.node_latencies.write().await;
-                let stats = latencies.entry(target_id).or_insert(LatencyStats {
-                    total_ms: 0,
-                    count: 0,
-                });
-                stats.total_ms += total_elapsed_ms;
-                stats.count += 1;
-                drop(latencies);
-                // Mark node as unhealthy when forwarding fails
-                let mut healthy = state.healthy_nodes.write().await;
-                healthy.insert(target_id, false);
-                drop(healthy);
-                
-                // Return error - client should retry (multicast again)
-                (
-                    StatusCode::BAD_GATEWAY,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to forward to node {}: {}"}}"#, target_id, e),
-                ).into_response()
-            }
-        }
-    }
-}
-
-/// Embed secret image bytes into a cover image using steganography
-/// Returns (stego_image_bytes, encryption_key_hex)
-fn embed_image_into_cover(secret_bytes: &[u8]) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
-    // Generate encryption key
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    
-    // Encrypt secret using ChaCha20Poly1305
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, secret_bytes)
-        .map_err(|e| format!("encrypt failed: {}", e))?;
+        };
 
     // Build payload: [4 bytes len][12 bytes nonce][ciphertext]
     let ct_len = ciphertext.len() as u32;
@@ -923,7 +774,11 @@ fn embed_image_into_cover(secret_bytes: &[u8]) -> Result<(Vec<u8>, String), Box<
 
     let capacity_bits = (side as usize) * (side as usize) * 3;
     if payload_bits > capacity_bits {
-        return Err("Payload too large for cover".into());
+        return (
+            StatusCode::BAD_REQUEST,
+            [("Content-Type", "application/json")],
+            format!(r#"{{"error": "Payload too large for cover"}}"#),
+        ).into_response();
     }
 
     // Convert payload to bits (LSB-first per byte)
@@ -966,17 +821,47 @@ fn embed_image_into_cover(secret_bytes: &[u8]) -> Result<(Vec<u8>, String), Box<
     }
     
     // Rebuild image from manipulated raw bytes
-    let stego_img = image::RgbaImage::from_raw(width, height, raw_bytes)
-        .ok_or("Failed to rebuild image from raw bytes")?;
+    let stego_img = match image::RgbaImage::from_raw(width, height, raw_bytes) {
+        Some(img) => img,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Content-Type", "application/json")],
+                format!(r#"{{"error": "Failed to rebuild image from raw bytes"}}"#),
+            ).into_response();
+        }
+    };
 
     // Encode PNG to bytes in memory
     let mut png_bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(stego_img)
-        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageOutputFormat::Png)?;
+    if let Err(e) = image::DynamicImage::ImageRgba8(stego_img)
+        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageOutputFormat::Png) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("Content-Type", "application/json")],
+            format!(r#"{{"error": "Failed to encode PNG: {}"}}"#, e),
+        ).into_response();
+    }
     
     // Return stego image and key in hex format
     let key_hex = hex::encode(&key);
-    Ok((png_bytes, key_hex))
+    
+    return (
+        StatusCode::OK,
+        [("Content-Type", "application/json")],
+        serde_json::json!({
+            "key": key_hex,
+            "image": png_bytes
+        }).to_string(),
+    ).into_response();
+    } else {
+        // Should not reach here, but handle for safety
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("Content-Type", "application/json")],
+            format!(r#"{{"error": "Invalid processing state"}}"#),
+        ).into_response();
+    }
 }
 
 /// Decrypt image - extract the original image from stego image
@@ -1042,12 +927,36 @@ async fn decrypt_image(
             match forward_request_to_node(target_id, &target_addr, &forward_url, &body).await {
                 Ok(response) => {
                     println!("✅ Forwarded decrypt to node {} succeeded", target_id);
-                    return response;
+                    // Convert reqwest::Response to axum::Response
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    match response.bytes().await {
+                        Ok(body_bytes) => {
+                            let mut axum_response = axum::response::Response::new(axum::body::Body::from(body_bytes.to_vec()));
+                            *axum_response.status_mut() = axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(axum::http::StatusCode::OK);
+                            for (k, v) in headers.iter() {
+                                if let Ok(header_name) = axum::http::HeaderName::from_bytes(k.as_str().as_bytes()) {
+                                    if let Ok(header_value) = axum::http::HeaderValue::from_bytes(v.as_bytes()) {
+                                        axum_response.headers_mut().insert(header_name, header_value);
+                                    }
+                                }
+                            }
+                            return axum_response.into_response();
+                        }
+                        Err(e) => {
+                            println!("❌ Failed to read response body: {}", e);
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                [("Content-Type", "application/json")],
+                                format!(r#"{{"error": "Failed to read response from node {}"}}"#, target_id),
+                            ).into_response();
+                        }
+                    }
                 }
                 Err(e) => {
                     println!("❌ Forwarding decrypt to node {} failed: {}, falling back to local processing", target_id, e);
                     // Mark node as unhealthy and fall through
-                    let mut healthy = state.healthy.write().await;
+                    let mut healthy = state.healthy_nodes.write().await;
                     healthy.insert(target_id, false);
                     drop(healthy);
                 }
