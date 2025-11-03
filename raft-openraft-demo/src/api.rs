@@ -1,12 +1,11 @@
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chacha20poly1305::{aead::Aead, aead::KeyInit, ChaCha20Poly1305, Key, Nonce};
-use hex;
 use openraft::{Raft, RaftMetrics, ServerState};
 use openraft_memstore::TypeConfig;
 use rand::rngs::OsRng;
@@ -15,53 +14,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::cors::{CorsLayer, Any};
 
 pub type NodeId = u64;
 pub type RaftNode = Raft<TypeConfig>;
 
-
-// Add this struct to track cluster state - for 1 node corner case
-#[derive(Debug, Clone)]
-pub struct ClusterState {
-    pub is_single_node_mode: bool,
-    pub total_nodes: usize,
-}
-
-impl Default for ClusterState {
-    fn default() -> Self {
-        Self {
-            is_single_node_mode: false,
-            total_nodes: 0,
-        }
-    }
-}
-/////////////////////////////////////////////////
-/// Latency statistics for a single node
-#[derive(Clone, Copy, Debug)]
-pub struct LatencyStats {
-    pub total_ms: u64,
-    pub count: u64,
-}
-
-impl LatencyStats {
-    pub fn average_ms(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.total_ms as f64 / self.count as f64
-        }
-    }
-}
-
-/// Track requests completed by each node
-#[derive(Debug, Clone, Default)]
-pub struct ThroughputStats {
-    pub completed_requests: u64,  // Requests completed in current period
-    pub throughput_req_per_sec: f64,  // Calculated throughput
-}
-
-/// Application state shared across HTTP handlers - Update AppState to include cluster state to handel 1-node mode
+/// Application state shared across HTTP handlers
 #[derive(Clone)]
 pub struct AppState {
     pub raft: Arc<RaftNode>,
@@ -69,72 +26,6 @@ pub struct AppState {
     pub http_addresses: Arc<RwLock<BTreeMap<NodeId, String>>>,
     pub self_http_addr: String,
     pub healthy_nodes: Arc<RwLock<BTreeMap<NodeId, bool>>>, // Track which nodes are healthy
-    pub node_latencies: Arc<RwLock<BTreeMap<NodeId, LatencyStats>>>, // Track latency per node (kept for logging)
-    pub node_throughput: Arc<RwLock<BTreeMap<NodeId, ThroughputStats>>>, // Track throughput per node
-    pub cluster_state: Arc<RwLock<ClusterState>>, // Track cluster state for single-node mode
-}
-
-// Add this function to check if we should be in single-node mode
-async fn check_single_node_mode(state: &AppState) -> bool {
-    let http_addrs = state.http_addresses.read().await;
-    let healthy_nodes = state.healthy_nodes.read().await;
-    
-    // Count healthy nodes (including self)
-    let mut healthy_count = 0;
-    for (node_id, _) in http_addrs.iter() {
-        if *node_id == state.node_id {
-            healthy_count += 1; // Self is always considered healthy
-        } else if healthy_nodes.get(node_id).copied().unwrap_or(false) {
-            healthy_count += 1;
-        }
-    }
-    
-    let total_nodes = http_addrs.len();
-    let is_single_node = healthy_count == 1 && total_nodes > 0;
-    
-    // Update cluster state
-    let mut cluster_state = state.cluster_state.write().await;
-    cluster_state.is_single_node_mode = is_single_node;
-    cluster_state.total_nodes = total_nodes;
-    
-    println!("🔍 Cluster state: {} healthy nodes out of {} total - single node mode: {}", 
-             healthy_count, total_nodes, is_single_node);
-    
-    is_single_node
-}
-
-/// Helper function to encode bytes as base64
-fn base64_encode(data: &[u8]) -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    let mut i = 0;
-    
-    while i < data.len() {
-        let b1 = data[i];
-        let b2 = if i + 1 < data.len() { data[i + 1] } else { 0 };
-        let b3 = if i + 2 < data.len() { data[i + 2] } else { 0 };
-        
-        let n = ((b1 as u32) << 16) | ((b2 as u32) << 8) | (b3 as u32);
-        
-        result.push(CHARSET[((n >> 18) & 0x3F) as usize] as char);
-        result.push(CHARSET[((n >> 12) & 0x3F) as usize] as char);
-        
-        if i + 1 < data.len() {
-            result.push(CHARSET[((n >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        
-        if i + 2 < data.len() {
-            result.push(CHARSET[(n & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        
-        i += 3;
-    }
-    
-    result
 }
 
 /// Request to initialize the cluster
@@ -166,13 +57,6 @@ pub struct ApiResponse<T> {
 
 /// Create the HTTP router
 pub fn create_router(app_state: AppState) -> Router {
-    // Configure CORS to allow cross-origin requests from web UI
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any);  // CRITICAL: Expose custom headers like X-Processed-By-Node to browser
-    
     Router::new()
         .route("/", get(root))
         .route("/metrics", get(metrics))
@@ -181,8 +65,6 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/cluster/change-membership", post(change_membership))
         .route("/image/echo", post(echo_image))      // Echo: return same image
         .route("/image/steg", post(steg_image))      // Steganography: embed and return stego image
-        .route("/image/decrypt", post(decrypt_image)) // Decrypt: extract from stego image
-        .layer(cors)
         .with_state(app_state)
 }
 
@@ -304,60 +186,24 @@ async fn forward_request_to_node(
         .map_err(|e| format!("Failed to forward to node {} at {}: {}", node_id, http_addr, e))
 }
 
-async fn forward_request_to_node_with_query(
-    node_id: NodeId,
-    http_addr: &str,
-    path: &str,
-    query_params: &str,
-    body: &[u8],
-) -> Result<reqwest::Response, String> {
-    let url = format!("http://{}{}?{}", http_addr, path, query_params);
-    // Create client with longer timeout for potentially large files
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-    
-    client
-        .post(&url)
-        .header("X-Raft-Forwarded", "true")
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|e| format!("Failed to forward to node {} at {}: {}", node_id, http_addr, e))
-}
-
-/// Get a node ID using latency-aware weighted selection
-/// Prefers fast, healthy nodes over slow ones using inverse latency weighting
-// Modify the get_random_node function to handle single-node mode
+/// Get a random node ID from available nodes (including self)
+/// Prefers healthy nodes, but gives unhealthy nodes a 10% chance for recovery
 async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     let http_addrs = state.http_addresses.read().await;
     let healthy = state.healthy_nodes.read().await;
     
-    println!("🔍 get_random_node CALLED: http_addrs has {} nodes, healthy has {} nodes", 
-             http_addrs.len(), healthy.len());
-    
-    // Check if we're in single-node mode
-    let cluster_state = state.cluster_state.read().await;
-    if cluster_state.is_single_node_mode {
-        println!("🎯 SINGLE-NODE MODE: Always selecting self (Node {})", state.node_id);
-        return Some((state.node_id, state.self_http_addr.clone()));
-    }
-    drop(cluster_state);
-    
     if http_addrs.is_empty() {
-        println!("⚠️  CRITICAL: http_addrs is EMPTY! Falling back to self (Node {})", state.node_id);
+        // Fallback to self (self is always considered healthy)
         return Some((state.node_id, state.self_http_addr.clone()));
     }
     
-    // ... rest of the existing function remains the same ...
     // Separate healthy and unhealthy nodes
     let mut healthy_node_ids: Vec<_> = Vec::new();
     let mut unhealthy_node_ids: Vec<_> = Vec::new();
     
     for (id, _) in http_addrs.iter() {
         if *id == state.node_id {
-            // Self is always considered healthy
+            // Self is always healthy
             healthy_node_ids.push(*id);
         } else if healthy.get(id).copied().unwrap_or(false) {
             healthy_node_ids.push(*id);
@@ -366,57 +212,14 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
         }
     }
     
-    println!("📊 Load balance analysis: {} healthy nodes (including self), {} unhealthy", 
-             healthy_node_ids.len(), unhealthy_node_ids.len());
-    
-    // STRATEGY: Throughput-aware weighted selection across ALL healthy nodes
-    // Faster nodes (higher throughput) get higher weight and thus more requests
-    if healthy_node_ids.len() > 1 {
-        let throughput = state.node_throughput.read().await;
-        
-        // Calculate weighted selection based on THROUGHPUT for ALL healthy nodes
-        let mut weighted_nodes: Vec<(NodeId, f64)> = Vec::new();
-        let mut total_weight: f64 = 0.0;
-        
-        for node_id in &healthy_node_ids {
-            let throughput_req_per_sec = throughput
-                .get(node_id)
-                .map(|s| s.throughput_req_per_sec)
-                .unwrap_or(1.0); // Default 1 req/s if no data yet
-            
-            // Weight = throughput (higher throughput = higher weight = more requests)
-            // Add small offset to avoid division by zero
-            let weight = throughput_req_per_sec + 0.1;
-            weighted_nodes.push((*node_id, weight));
-            total_weight += weight;
-        }
-        
-        // Select node based on weighted probability
-        let mut rand_val = (random::<f64>()) * total_weight;
-        for (node_id, weight) in weighted_nodes {
-            rand_val -= weight;
-            if rand_val <= 0.0 {
-                let addr = if node_id == state.node_id {
-                    state.self_http_addr.clone()
-                } else {
-                    http_addrs.get(&node_id)?.clone()
-                };
-                let throughput_str = throughput
-                    .get(&node_id)
-                    .map(|s| format!("{:.1} req/s", s.throughput_req_per_sec))
-                    .unwrap_or("unknown".to_string());
-                println!("🎯 THROUGHPUT-WEIGHTED: Selected node {} (throughput: {})", node_id, throughput_str);
-                return Some((node_id, addr));
-            }
-        }
-    }
-    
     // If we have healthy nodes and random check (20% chance), give unhealthy nodes a chance
+    // This allows crashed nodes to prove they've recovered
     let use_unhealthy = !healthy_node_ids.is_empty() && 
                         !unhealthy_node_ids.is_empty() && 
-                        (random::<usize>() % 5) == 0;
+                        (random::<usize>() % 5) == 0; // 20% chance (1 in 5)
     
     if use_unhealthy && !unhealthy_node_ids.is_empty() {
+        // Give an unhealthy node a chance to prove it's back
         let idx = random::<usize>() % unhealthy_node_ids.len();
         let selected_id = unhealthy_node_ids[idx];
         let addr = http_addrs.get(&selected_id)?.clone();
@@ -426,8 +229,8 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     
     // Normal case: select from healthy nodes
     if healthy_node_ids.is_empty() {
+        // No healthy nodes, try unhealthy ones
         if unhealthy_node_ids.is_empty() {
-            println!("⚠️  No nodes available, processing locally");
             return Some((state.node_id, state.self_http_addr.clone()));
         }
         let idx = random::<usize>() % unhealthy_node_ids.len();
@@ -440,14 +243,11 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     let selected_id = healthy_node_ids[idx];
     let addr = http_addrs.get(&selected_id)?.clone();
     
-    println!("✅ get_random_node selected node {} from {} healthy nodes", selected_id, healthy_node_ids.len());
-    
     Some((selected_id, addr))
 }
 
 /// Echo image - receive and return immediately (no processing)
 /// Load balancing: Followers reject direct requests, Leader forwards randomly
-// Modify the image processing handlers to check single-node mode
 async fn echo_image(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -455,19 +255,15 @@ async fn echo_image(
 ) -> impl IntoResponse {
     let image_size = body.len();
     
-    // Update cluster state and check for single-node mode
-    let is_single_node = check_single_node_mode(&state).await;
-    
     // Check if this is a forwarded request from the leader
     let is_forwarded = headers.contains_key("x-raft-forwarded");
     
-    // Check if we're the leader OR in single-node mode
+    // Check if we're the leader
     let metrics = state.raft.metrics().borrow().clone();
     let is_leader = matches!(metrics.state, ServerState::Leader);
-    let can_process = is_leader || is_single_node;
     
-    // In single-node mode, we can process requests directly
-    if !can_process && !is_forwarded {
+    // Followers only accept forwarded requests, not direct client requests
+    if !is_leader && !is_forwarded {
         println!("🚫 Node {} (follower) dropping direct echo request - only leader processes direct requests", state.node_id);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -476,13 +272,9 @@ async fn echo_image(
         ).into_response();
     }
     
-    // If we can process (leader or single-node mode) and it's not forwarded, or if it's forwarded to follower
-    if (!can_process && is_forwarded) || (can_process && !is_forwarded) {
-        println!("📥 Node {} ({}) processing {} echo request: {} bytes", 
-                state.node_id,
-                if is_single_node { "single-node" } else if is_leader { "leader" } else { "follower" },
-                if is_forwarded { "forwarded" } else { "direct" },
-                image_size);
+    // If forwarded request and we're a follower, process it
+    if !is_leader && is_forwarded {
+        println!("📥 Node {} (follower) processing forwarded echo request: {} bytes", state.node_id, image_size);
         println!("📤 Echoing back {} bytes", image_size);
         return (
             StatusCode::OK,
@@ -494,7 +286,7 @@ async fn echo_image(
         ).into_response();
     }
     
-    // Leader in multi-node mode: randomly assign to a node (including self)
+    // Leader: randomly assign to a node (including self)
     let (target_id, target_addr) = match get_random_node(&state).await {
         Some(addr) => addr,
         None => {
@@ -570,46 +362,31 @@ async fn echo_image(
 
 /// Embed image - receive image and return stego image with secret embedded
 /// Load balancing: Followers reject direct requests, Leader forwards randomly
-/// Steganography embed response with encryption key
-#[derive(Debug, Serialize)]
-pub struct SteganographyResponse {
-    pub key: String,  // Encryption key in hex format
-    pub image: Vec<u8>,  // Stego image in PNG format
-}
-
-// Similarly modify steg_image and decrypt_image functions:
-
 async fn steg_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let request_start = std::time::Instant::now();
     let image_size = body.len();
     
-    // Update cluster state and check for single-node mode
-    let is_single_node = check_single_node_mode(&state).await;
-    
-    // Check Raft state first
-    let metrics = state.raft.metrics().borrow().clone();
-    let is_leader = matches!(metrics.state, ServerState::Leader);
-    let is_forwarded = headers.contains_key("x-raft-forwarded");
-    let can_process = is_leader || is_single_node;
-    
-    println!("📨 steg_image: Node {} (is_leader={}, single_node_mode={}, is_forwarded={}) received {} bytes", 
-             state.node_id, is_leader, is_single_node, is_forwarded, image_size);
-    
-    // Check if image is too large (max 10MB for safety)
-    if image_size > 10_485_760 {
+    // Check if image is too large (max 1MB for safety)
+    if image_size > 1_048_576 {
         return (
             StatusCode::BAD_REQUEST,
             [("Content-Type", "application/json")],
-            format!(r#"{{"error": "Image too large (max 10MB), received {} bytes"}}"#, image_size),
+            format!(r#"{{"error": "Image too large (max 1MB), received {} bytes"}}"#, image_size),
         ).into_response();
     }
     
-    // In single-node mode, we can process requests directly
-    if !can_process && !is_forwarded {
+    // Check if this is a forwarded request from the leader
+    let is_forwarded = headers.contains_key("x-raft-forwarded");
+    
+    // Check if we're the leader
+    let metrics = state.raft.metrics().borrow().clone();
+    let is_leader = matches!(metrics.state, ServerState::Leader);
+    
+    // Followers only accept forwarded requests, not direct client requests
+    if !is_leader && !is_forwarded {
         println!("🚫 Node {} (follower) dropping direct steg request - only leader processes direct requests", state.node_id);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -618,37 +395,22 @@ async fn steg_image(
         ).into_response();
     }
     
-    // If we can process (leader or single-node mode) and it's not forwarded, or if it's forwarded to follower
-    if (!can_process && is_forwarded) || (can_process && !is_forwarded) {
-        println!("📥 Node {} ({}) processing {} steg request: {} bytes", 
-                state.node_id,
-                if is_single_node { "single-node" } else if is_leader { "leader" } else { "follower" },
-                if is_forwarded { "forwarded" } else { "direct" },
-                image_size);
+    // If forwarded request and we're a follower, process it
+    if !is_leader && is_forwarded {
+        println!("📥 Node {} (follower) processing forwarded steg request: {} bytes", state.node_id, image_size);
         println!("🔐 Starting steganography embedding...");
         println!("🔒 Encrypting and embedding image...");
-        
-        // Spawn CPU-intensive image processing in blocking task
+        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
         let body_clone = body.clone();
         let node_id = state.node_id;
         match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
-            Ok(Ok((stego_bytes, key_hex))) => {
+            Ok(Ok(stego_bytes)) => {
                 println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
                          node_id, stego_bytes.len(), image_size);
-                println!("🔑 Encryption key: {}", key_hex);
-                
-                // Encode image as base64
-                let image_base64 = format!("data:image/png;base64,{}", base64_encode(&stego_bytes));
-                
                 return (
                     StatusCode::OK,
-                    [
-                        ("Content-Type", "application/json"),
-                        ("X-Processed-By-Node", &format!("{}", node_id)),
-                    ],
-                    axum::body::Body::from(
-                        format!(r#"{{"key": "{}", "image": "{}"}}"#, key_hex, image_base64)
-                    ),
+                    [("Content-Type", "image/png")],
+                    axum::body::Bytes::from(stego_bytes),
                 ).into_response();
             }
             Ok(Err(e)) => {
@@ -670,10 +432,7 @@ async fn steg_image(
         }
     }
     
-    
-    
     // Leader: randomly assign to a node (including self)
-    println!("👉 Leader {} calling get_random_node()...", state.node_id);
     let (target_id, target_addr) = match get_random_node(&state).await {
         Some(addr) => addr,
         None => {
@@ -682,58 +441,22 @@ async fn steg_image(
         }
     };
     
-    println!("🎯 Leader {} selected target node {} at addr {}", state.node_id, target_id, target_addr);
-    
     if target_id == state.node_id {
-        // Process locally with latency tracking
+        // Process locally
         println!("📥 Node {} (leader) processing steg request locally: {} bytes", state.node_id, image_size);
         println!("🔐 Starting steganography embedding...");
         println!("🔒 Encrypting and embedding image...");
         // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
         let body_clone = body.clone();
         let node_id = state.node_id;
-        let state_clone = state.clone();
-        
         match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
-            Ok(Ok((stego_bytes, key_hex))) => {
-                // Measure TOTAL latency from HTTP receive to response send (what the client experiences)
-                let total_elapsed_ms = request_start.elapsed().as_millis() as u64;
-                println!("✅ Node {} created stego image: {} bytes (original: {} bytes) (total latency: {}ms)", 
-                         node_id, stego_bytes.len(), image_size, total_elapsed_ms);
-                println!("🔑 Encryption key: {}", key_hex);
-                
-                // Record TOTAL latency (including all overhead like HTTP, selection, etc.)
-                // This ensures fair comparison with forwarded requests
-                let mut latencies = state_clone.node_latencies.write().await;
-                let stats = latencies.entry(node_id).or_insert(LatencyStats {
-                    total_ms: 0,
-                    count: 0,
-                });
-                stats.total_ms += total_elapsed_ms;
-                stats.count += 1;
-                drop(latencies);
-                
-                // Increment successful request counter for throughput tracking
-                let mut throughput = state_clone.node_throughput.write().await;
-                let tp_stats = throughput.entry(node_id).or_insert(ThroughputStats {
-                    completed_requests: 0,
-                    throughput_req_per_sec: 0.0,
-                });
-                tp_stats.completed_requests += 1;
-                drop(throughput);
-                
-                // Encode image as base64
-                let image_base64 = format!("data:image/png;base64,{}", base64_encode(&stego_bytes));
-                
+            Ok(Ok(stego_bytes)) => {
+                println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
+                         node_id, stego_bytes.len(), image_size);
                 (
                     StatusCode::OK,
-                    [
-                        ("Content-Type", "application/json"),
-                        ("X-Processed-By-Node", &format!("{}", node_id)),
-                    ],
-                    axum::body::Body::from(
-                        format!(r#"{{"key": "{}", "image": "{}"}}"#, key_hex, image_base64)
-                    ),
+                    [("Content-Type", "image/png")],
+                    axum::body::Bytes::from(stego_bytes),
                 ).into_response()
             }
             Ok(Err(e)) => {
@@ -755,63 +478,27 @@ async fn steg_image(
             }
         }
     } else {
-        // Forward to selected node with retry logic and latency tracking
+        // Forward to selected node with retry logic
         println!("🔄 Node {} (leader) forwarding steg request to node {} at {}", 
                 state.node_id, target_id, target_addr);
         match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
             Ok(response) => {
                 match response.bytes().await {
                     Ok(bytes) => {
-                        // Measure TOTAL latency from HTTP receive to response send (includes all overhead)
-                        let total_elapsed_ms = request_start.elapsed().as_millis() as u64;
-                        println!("✅ Received stego image from node {}: {} bytes (total latency: {}ms)", 
-                                target_id, bytes.len(), total_elapsed_ms);
-                        
-                        // Record TOTAL latency for fair comparison with local processing
-                        let mut latencies = state.node_latencies.write().await;
-                        let stats = latencies.entry(target_id).or_insert(LatencyStats {
-                            total_ms: 0,
-                            count: 0,
-                        });
-                        stats.total_ms += total_elapsed_ms;
-                        stats.count += 1;
-                        drop(latencies);
-                        
-                        // Increment successful request counter for throughput tracking
-                        let mut throughput = state.node_throughput.write().await;
-                        let tp_stats = throughput.entry(target_id).or_insert(ThroughputStats {
-                            completed_requests: 0,
-                            throughput_req_per_sec: 0.0,
-                        });
-                        tp_stats.completed_requests += 1;
-                        drop(throughput);
-                        
+                        println!("✅ Received stego image from node {}: {} bytes", target_id, bytes.len());
                         // Mark node as healthy on successful response
                         let mut healthy = state.healthy_nodes.write().await;
                         healthy.insert(target_id, true);
                         drop(healthy);
                         
-                        // Forward the response from the target node, preserving Content-Type
-                        // and adding X-Processed-By-Node header to track which node did the work
-                        let mut headers = HeaderMap::new();
-                        headers.insert("Content-Type", "application/json".parse().unwrap());
-                        headers.insert("X-Processed-By-Node", format!("{}", target_id).parse().unwrap());
-                        (StatusCode::OK, headers, bytes).into_response()
+                        (
+                            StatusCode::OK,
+                            [("Content-Type", "image/png")],
+                            bytes,
+                        ).into_response()
                     }
                     Err(e) => {
-                        let total_elapsed_ms = request_start.elapsed().as_millis() as u64;
-                        eprintln!("❌ Failed to read response from node {}: {} (total latency: {}ms)", target_id, e, total_elapsed_ms);
-                        
-                        // Record latency (slow failures matter too!)
-                        let mut latencies = state.node_latencies.write().await;
-                        let stats = latencies.entry(target_id).or_insert(LatencyStats {
-                            total_ms: 0,
-                            count: 0,
-                        });
-                        stats.total_ms += total_elapsed_ms;
-                        stats.count += 1;
-                        drop(latencies);
-                        
+                        eprintln!("❌ Failed to read response from node {}: {}", target_id, e);
                         // Mark node as unhealthy
                         let mut healthy = state.healthy_nodes.write().await;
                         healthy.insert(target_id, false);
@@ -827,18 +514,7 @@ async fn steg_image(
                 }
             }
             Err(e) => {
-                let total_elapsed_ms = request_start.elapsed().as_millis() as u64;
-                eprintln!("❌ Failed to forward to node {}: {} (total latency: {}ms) - marking as unhealthy", target_id, e, total_elapsed_ms);
-                
-                // Record latency even on failure
-                let mut latencies = state.node_latencies.write().await;
-                let stats = latencies.entry(target_id).or_insert(LatencyStats {
-                    total_ms: 0,
-                    count: 0,
-                });
-                stats.total_ms += total_elapsed_ms;
-                stats.count += 1;
-                drop(latencies);
+                eprintln!("❌ Failed to forward to node {}: {} - marking as unhealthy", target_id, e);
                 // Mark node as unhealthy when forwarding fails
                 let mut healthy = state.healthy_nodes.write().await;
                 healthy.insert(target_id, false);
@@ -856,8 +532,8 @@ async fn steg_image(
 }
 
 /// Embed secret image bytes into a cover image using steganography
-/// Returns (stego_image_bytes, encryption_key_hex)
-fn embed_image_into_cover(secret_bytes: &[u8]) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+/// Returns PNG bytes of the stego image
+fn embed_image_into_cover(secret_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     // Generate encryption key
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
@@ -943,269 +619,7 @@ fn embed_image_into_cover(secret_bytes: &[u8]) -> Result<(Vec<u8>, String), Box<
     image::DynamicImage::ImageRgba8(stego_img)
         .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageOutputFormat::Png)?;
     
-    // Return stego image and key in hex format
-    let key_hex = hex::encode(&key);
-    Ok((png_bytes, key_hex))
-}
-
-/// Decrypt image - extract the original image from stego image
-#[derive(Debug, Deserialize)]
-pub struct DecryptQuery {
-    pub key: String,
-}
-
-async fn decrypt_image(
-    State(state): State<AppState>,
-    Query(params): Query<DecryptQuery>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let image_size = body.len();
-    
-    // Check Raft state first
-    let metrics = state.raft.metrics().borrow().clone();
-    let is_leader = matches!(metrics.state, ServerState::Leader);
-    let is_forwarded = headers.contains_key("x-raft-forwarded");
-    
-    println!("📨 decrypt_image: Node {} (is_leader={}, is_forwarded={}) received {} bytes", 
-             state.node_id, is_leader, is_forwarded, image_size);
-    
-    // Check if image is too large (max 10MB for safety)
-    if image_size > 10_485_760 {
-        return (
-            StatusCode::BAD_REQUEST,
-            [("Content-Type", "application/json")],
-            format!(r#"{{"error": "Image too large (max 10MB), received {} bytes"}}"#, image_size),
-        ).into_response();
-    }
-    
-    // Followers only accept forwarded requests, not direct client requests
-    if !is_leader && !is_forwarded {
-        println!("🚫 Node {} (follower) dropping direct decrypt request - only leader processes direct requests", state.node_id);
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [("Content-Type", "application/json")],
-            format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
-        ).into_response();
-    }
-    
-    // If forwarded request and we're a follower, process it
-    if !is_leader && is_forwarded {
-        println!("📥 Node {} (follower) processing forwarded decrypt request: {} bytes", state.node_id, image_size);
-        println!("🔓 Starting steganography extraction...");
-        
-        // Decode hex key to bytes
-        let key_bytes = match hex::decode(&params.key) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                eprintln!("❌ Node {} invalid hex key: {}", state.node_id, e);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Invalid encryption key format: {}"}}"#, e),
-                ).into_response();
-            }
-        };
-        
-        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
-        let body_clone = body.clone();
-        let node_id = state.node_id;
-        match tokio::task::spawn_blocking(move || extract_image_from_stego(&body_clone[..], &key_bytes)).await {
-            Ok(Ok(extracted_bytes)) => {
-                println!("✅ Node {} extracted image: {} bytes", node_id, extracted_bytes.len());
-                return (
-                    StatusCode::OK,
-                    [
-                        ("Content-Type", "application/octet-stream"),
-                        ("X-Processed-By-Node", &format!("{}", node_id)),
-                    ],
-                    axum::body::Bytes::from(extracted_bytes),
-                ).into_response();
-            }
-            Ok(Err(e)) => {
-                eprintln!("❌ Node {} failed to extract image: {}", node_id, e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to extract image: {}"}}"#, e),
-                ).into_response();
-            }
-            Err(e) => {
-                eprintln!("❌ Node {} task join error: {}", node_id, e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Task execution failed"}}"#),
-                ).into_response();
-            }
-        }
-    }
-    
-    // Leader: randomly assign to a node (including self)
-    println!("👉 Leader {} calling get_random_node()...", state.node_id);
-    let (target_id, target_addr) = match get_random_node(&state).await {
-        Some(addr) => addr,
-        None => {
-            println!("⚠️  No available nodes for forwarding, processing locally");
-            (state.node_id, state.self_http_addr.clone())
-        }
-    };
-    
-    println!("🎯 Leader {} selected target node {} at addr {}", state.node_id, target_id, target_addr);
-    
-    if target_id == state.node_id {
-        // Process locally
-        println!("📥 Node {} (leader) processing decrypt request locally: {} bytes", state.node_id, image_size);
-        println!("🔓 Starting steganography extraction...");
-        
-        // Decode hex key to bytes
-        let key_bytes = match hex::decode(&params.key) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                eprintln!("❌ Node {} invalid hex key: {}", state.node_id, e);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Invalid encryption key format: {}"}}"#, e),
-                ).into_response();
-            }
-        };
-        
-        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
-        let body_clone = body.clone();
-        let node_id = state.node_id;
-        match tokio::task::spawn_blocking(move || extract_image_from_stego(&body_clone[..], &key_bytes)).await {
-            Ok(Ok(extracted_bytes)) => {
-                println!("✅ Node {} extracted image: {} bytes", node_id, extracted_bytes.len());
-                (
-                    StatusCode::OK,
-                    [
-                        ("Content-Type", "application/octet-stream"),
-                        ("X-Processed-By-Node", &format!("{}", node_id)),
-                    ],
-                    axum::body::Bytes::from(extracted_bytes),
-                ).into_response()
-            }
-            Ok(Err(e)) => {
-                eprintln!("❌ Node {} failed to extract image: {}", node_id, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to extract image: {}"}}"#, e),
-                ).into_response()
-            }
-            Err(e) => {
-                eprintln!("❌ Node {} task join error: {}", node_id, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Task execution failed"}}"#),
-                ).into_response()
-            }
-        }
-    } else {
-        // Forward to target node
-        println!("🔄 Leader {} forwarding decrypt request to node {}", state.node_id, target_id);
-        let query_string = format!("key={}", urlencoding::encode(&params.key));
-        match forward_request_to_node_with_query(target_id, &target_addr, "/image/decrypt", &query_string, &body).await {
-            Ok(response) => {
-                match response.bytes().await {
-                    Ok(response_bytes) => {
-                        println!("✅ Leader {} received response from node {}: {} bytes", state.node_id, target_id, response_bytes.len());
-                        (
-                            StatusCode::OK,
-                            [
-                                ("Content-Type", "application/octet-stream"),
-                                ("X-Processed-By-Node", &format!("{}", target_id)),
-                            ],
-                            axum::body::Bytes::from(response_bytes),
-                        ).into_response()
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Failed to read response body from node {}: {}", target_id, e);
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            [("Content-Type", "application/json")],
-                            format!(r#"{{"error": "Failed to read response: {}"}}"#, e),
-                        ).into_response()
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ Forward to node {} failed: {}", target_id, e);
-                (
-                    StatusCode::BAD_GATEWAY,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Forwarding failed: {}"}}"#, e),
-                ).into_response()
-            }
-        }
-    }
-}
-
-/// Extract image from stego image (LSB steganography) with user-provided key
-fn extract_image_from_stego(stego_bytes: &[u8], key_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    // Load stego image
-    let stego_img = image::load_from_memory(stego_bytes)?;
-    let stego_rgba = stego_img.to_rgba8();
-    let raw_bytes = stego_rgba.as_raw();
-    
-    // Extract bits from LSB of R, G, B channels
-    let mut extracted_bits = Vec::new();
-    for pixel_chunk in raw_bytes.chunks_exact(4) {
-        // Extract from R channel
-        extracted_bits.push(((pixel_chunk[0] & 1) != 0) as u8);
-        
-        // Extract from G channel
-        extracted_bits.push(((pixel_chunk[1] & 1) != 0) as u8);
-        
-        // Extract from B channel
-        extracted_bits.push(((pixel_chunk[2] & 1) != 0) as u8);
-    }
-    
-    // Convert bits to bytes (LSB-first per byte)
-    let mut payload_bytes = Vec::new();
-    for byte_bits in extracted_bits.chunks_exact(8) {
-        let mut byte = 0u8;
-        for (i, &bit) in byte_bits.iter().enumerate() {
-            byte |= bit << i;
-        }
-        payload_bytes.push(byte);
-    }
-    
-    // Parse payload: [4 bytes len][12 bytes nonce][ciphertext]
-    if payload_bytes.len() < 16 {
-        return Err("Payload too small".into());
-    }
-    
-    let ct_len = u32::from_le_bytes([
-        payload_bytes[0],
-        payload_bytes[1],
-        payload_bytes[2],
-        payload_bytes[3],
-    ]) as usize;
-    
-    let nonce_bytes = &payload_bytes[4..16];
-    let ciphertext = &payload_bytes[16..16 + ct_len];
-    
-    if payload_bytes.len() < 16 + ct_len {
-        return Err("Incomplete ciphertext".into());
-    }
-    
-    // Validate key length (must be exactly 32 bytes for ChaCha20Poly1305)
-    if key_bytes.len() != 32 {
-        return Err(format!("Invalid key size: expected 32 bytes, got {}", key_bytes.len()).into());
-    }
-    
-    // Decrypt with the user-provided key
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key_bytes));
-    let nonce = Nonce::from_slice(nonce_bytes);
-    
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| format!("Decryption failed - invalid key or corrupted data: {}", e))?;
-    
-    Ok(plaintext)
+    Ok(png_bytes)
 }
 
 /// Error wrapper
