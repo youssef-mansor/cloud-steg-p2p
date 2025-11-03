@@ -369,29 +369,31 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     println!("📊 Load balance analysis: {} healthy nodes (including self), {} unhealthy", 
              healthy_node_ids.len(), unhealthy_node_ids.len());
     
-    // STRATEGY: Throughput-aware weighted selection across ALL healthy nodes
-    // Faster nodes (higher throughput) get higher weight and thus more requests
+    // STRATEGY: Fair distribution with slight preference for better-performing nodes
+    // All nodes get equal base chance, then boost is proportional to throughput
     if healthy_node_ids.len() > 1 {
         let throughput = state.node_throughput.read().await;
         
-        // Calculate weighted selection based on THROUGHPUT for ALL healthy nodes
+        // Calculate weighted selection: all nodes start with equal weight (fairness)
+        // then get bonus based on relative performance
         let mut weighted_nodes: Vec<(NodeId, f64)> = Vec::new();
         let mut total_weight: f64 = 0.0;
         
-        // Calculate average throughput to set a baseline
-        let mut sum_throughput = 0.0;
-        let mut count = 0;
+        // All healthy nodes start with equal base weight (for fairness)
+        // This ensures even idle/new nodes get work
+        let base_weight = 100.0;  // Equal base for all nodes
+        
+        // Calculate max throughput for performance bonus scaling
+        let mut max_throughput = 0.0;
         for node_id in &healthy_node_ids {
             let tp = throughput
                 .get(node_id)
                 .map(|s| s.throughput_req_per_sec)
                 .unwrap_or(0.0);
-            sum_throughput += tp;
-            count += 1;
+            if tp > max_throughput {
+                max_throughput = tp;
+            }
         }
-        let avg_throughput = if count > 0 { sum_throughput / count as f64 } else { 1.0 };
-        // Use minimum of 5 req/s or average throughput as baseline to ensure new nodes get work
-        let baseline_throughput = avg_throughput.max(5.0);
         
         for node_id in &healthy_node_ids {
             let throughput_req_per_sec = throughput
@@ -399,10 +401,14 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
                 .map(|s| s.throughput_req_per_sec)
                 .unwrap_or(0.0);
             
-            // Weight = baseline + actual throughput
-            // This ensures nodes with zero throughput still get a fair baseline weight
-            // while allowing better performing nodes to get proportionally more work
-            let weight = baseline_throughput + throughput_req_per_sec;
+            // Weight = base weight + small bonus (max 25% extra) for better performers
+            // This prevents any node from dominating while still rewarding good performance
+            let performance_bonus = if max_throughput > 0.0 {
+                (throughput_req_per_sec / max_throughput) * 25.0  // Bonus: 0-25% of base
+            } else {
+                0.0  // No bonus if no throughput data yet
+            };
+            let weight = base_weight + performance_bonus;
             weighted_nodes.push((*node_id, weight));
             total_weight += weight;
         }
@@ -422,7 +428,7 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
                     .map(|s| s.throughput_req_per_sec)
                     .unwrap_or(0.0);
                 let selection_probability = (weight / total_weight) * 100.0;
-                println!("🎯 THROUGHPUT-WEIGHTED: Selected node {} (throughput: {:.1} req/s, weight: {:.1}, probability: {:.1}%)", 
+                println!("🎯 FAIR-WEIGHTED: Selected node {} (throughput: {:.1} req/s, weight: {:.1}, probability: {:.1}%)", 
                          node_id, actual_throughput, weight, selection_probability);
                 return Some((node_id, addr));
             }
