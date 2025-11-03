@@ -252,12 +252,23 @@ async fn main() -> Result<()> {
         }
     });
 
-    let app = api::create_router(app_state);
+    let app = api::create_router(app_state.clone());
+    
+    // Spawn background task to periodically check for single-node mode
+    let state_clone = app_state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            api::check_single_node_mode(&state_clone).await;
+        }
+    });
+    
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
 
     println!("🌐 HTTP API listening on {}", args.http_addr);
     println!("🌍 CORS enabled - allowing cross-origin requests from any origin");
     println!("⚡ Server configured with multi-threaded async runtime (8 worker threads)");
+    println!("🔄 Single-node mode checker running in background");
 
     axum::serve(listener, app).await?;
 

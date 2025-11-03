@@ -76,7 +76,7 @@ pub struct AppState {
 }
 
 // Add this function to check if we should be in single-node mode
-async fn check_single_node_mode(state: &AppState) -> bool {
+pub async fn check_single_node_mode(state: &AppState) -> bool {
     let http_addrs = state.http_addresses.read().await;
     let healthy_nodes = state.healthy_nodes.read().await;
     
