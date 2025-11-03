@@ -846,14 +846,12 @@ async fn steg_image(
     // Return stego image and key in hex format
     let key_hex = hex::encode(&key);
     
-    return (
-        StatusCode::OK,
-        [("Content-Type", "application/json")],
-        serde_json::json!({
-            "key": key_hex,
-            "image": png_bytes
-        }).to_string(),
-    ).into_response();
+    let response = SteganographyResponse {
+        key: key_hex,
+        image: png_bytes,
+    };
+    
+    return (StatusCode::OK, axum::Json(response)).into_response();
     } else {
         // Should not reach here, but handle for safety
         return (
