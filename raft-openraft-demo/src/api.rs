@@ -78,15 +78,35 @@ pub struct AppState {
 // Add this function to check if we should be in single-node mode
 pub async fn check_single_node_mode(state: &AppState) -> bool {
     let http_addrs = state.http_addresses.read().await;
-    let healthy_nodes = state.healthy_nodes.read().await;
     
-    // Count healthy nodes (including self)
-    let mut healthy_count = 0;
-    for (node_id, _) in http_addrs.iter() {
+    // Actively check health of other nodes by trying to connect
+    let mut healthy_count = 1; // Self is always healthy
+    let mut healthy_updates = Vec::new();
+    
+    for (node_id, http_addr) in http_addrs.iter() {
         if *node_id == state.node_id {
-            healthy_count += 1; // Self is always considered healthy
-        } else if healthy_nodes.get(node_id).copied().unwrap_or(false) {
+            continue; // Skip self
+        }
+        
+        // Try to connect to the node's HTTP endpoint with short timeout
+        let health_check = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(http_addr)
+        ).await;
+        
+        let is_healthy = health_check.is_ok();
+        healthy_updates.push((*node_id, is_healthy));
+        
+        if is_healthy {
             healthy_count += 1;
+        }
+    }
+    
+    // Update healthy nodes map
+    {
+        let mut healthy_nodes = state.healthy_nodes.write().await;
+        for (node_id, is_healthy) in healthy_updates {
+            healthy_nodes.insert(node_id, is_healthy);
         }
     }
     
