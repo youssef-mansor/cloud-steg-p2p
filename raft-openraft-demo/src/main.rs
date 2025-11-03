@@ -13,8 +13,10 @@ use openraft::{Config, Raft};
 use openraft::storage::Adaptor;
 use network::NetworkFactory;
 use openraft_memstore::MemStore;
-use api::AppState;
+use api::{AppState, ClusterState};
 use rpc_handler::start_rpc_server;
+use tokio::sync::RwLock; // Add this import
+
 
 pub type NodeId = u64;
 
@@ -225,6 +227,7 @@ async fn main() -> Result<()> {
         healthy_nodes: Arc::new(tokio::sync::RwLock::new(healthy_nodes)),
         node_latencies: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
         node_throughput: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
+        cluster_state: Arc::new(RwLock::new(ClusterState::default())), // Now this uses api::ClusterState
     };
     
     // Spawn periodic task to recalculate throughput every second

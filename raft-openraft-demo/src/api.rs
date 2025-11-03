@@ -20,6 +20,23 @@ use tower_http::cors::{CorsLayer, Any};
 pub type NodeId = u64;
 pub type RaftNode = Raft<TypeConfig>;
 
+
+// Add this struct to track cluster state - for 1 node corner case
+#[derive(Debug, Clone)]
+pub struct ClusterState {
+    pub is_single_node_mode: bool,
+    pub total_nodes: usize,
+}
+
+impl Default for ClusterState {
+    fn default() -> Self {
+        Self {
+            is_single_node_mode: false,
+            total_nodes: 0,
+        }
+    }
+}
+/////////////////////////////////////////////////
 /// Latency statistics for a single node
 #[derive(Clone, Copy, Debug)]
 pub struct LatencyStats {
@@ -44,7 +61,7 @@ pub struct ThroughputStats {
     pub throughput_req_per_sec: f64,  // Calculated throughput
 }
 
-/// Application state shared across HTTP handlers
+/// Application state shared across HTTP handlers - Update AppState to include cluster state to handel 1-node mode
 #[derive(Clone)]
 pub struct AppState {
     pub raft: Arc<RaftNode>,
@@ -54,6 +71,36 @@ pub struct AppState {
     pub healthy_nodes: Arc<RwLock<BTreeMap<NodeId, bool>>>, // Track which nodes are healthy
     pub node_latencies: Arc<RwLock<BTreeMap<NodeId, LatencyStats>>>, // Track latency per node (kept for logging)
     pub node_throughput: Arc<RwLock<BTreeMap<NodeId, ThroughputStats>>>, // Track throughput per node
+    pub cluster_state: Arc<RwLock<ClusterState>>, // Track cluster state for single-node mode
+}
+
+// Add this function to check if we should be in single-node mode
+async fn check_single_node_mode(state: &AppState) -> bool {
+    let http_addrs = state.http_addresses.read().await;
+    let healthy_nodes = state.healthy_nodes.read().await;
+    
+    // Count healthy nodes (including self)
+    let mut healthy_count = 0;
+    for (node_id, _) in http_addrs.iter() {
+        if *node_id == state.node_id {
+            healthy_count += 1; // Self is always considered healthy
+        } else if healthy_nodes.get(node_id).copied().unwrap_or(false) {
+            healthy_count += 1;
+        }
+    }
+    
+    let total_nodes = http_addrs.len();
+    let is_single_node = healthy_count == 1 && total_nodes > 0;
+    
+    // Update cluster state
+    let mut cluster_state = state.cluster_state.write().await;
+    cluster_state.is_single_node_mode = is_single_node;
+    cluster_state.total_nodes = total_nodes;
+    
+    println!("🔍 Cluster state: {} healthy nodes out of {} total - single node mode: {}", 
+             healthy_count, total_nodes, is_single_node);
+    
+    is_single_node
 }
 
 /// Helper function to encode bytes as base64
@@ -282,19 +329,28 @@ async fn forward_request_to_node_with_query(
 
 /// Get a node ID using latency-aware weighted selection
 /// Prefers fast, healthy nodes over slow ones using inverse latency weighting
+// Modify the get_random_node function to handle single-node mode
 async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     let http_addrs = state.http_addresses.read().await;
     let healthy = state.healthy_nodes.read().await;
-    let latencies = state.node_latencies.read().await;
     
     println!("🔍 get_random_node CALLED: http_addrs has {} nodes, healthy has {} nodes", 
              http_addrs.len(), healthy.len());
+    
+    // Check if we're in single-node mode
+    let cluster_state = state.cluster_state.read().await;
+    if cluster_state.is_single_node_mode {
+        println!("🎯 SINGLE-NODE MODE: Always selecting self (Node {})", state.node_id);
+        return Some((state.node_id, state.self_http_addr.clone()));
+    }
+    drop(cluster_state);
     
     if http_addrs.is_empty() {
         println!("⚠️  CRITICAL: http_addrs is EMPTY! Falling back to self (Node {})", state.node_id);
         return Some((state.node_id, state.self_http_addr.clone()));
     }
     
+    // ... rest of the existing function remains the same ...
     // Separate healthy and unhealthy nodes
     let mut healthy_node_ids: Vec<_> = Vec::new();
     let mut unhealthy_node_ids: Vec<_> = Vec::new();
@@ -391,6 +447,7 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
 
 /// Echo image - receive and return immediately (no processing)
 /// Load balancing: Followers reject direct requests, Leader forwards randomly
+// Modify the image processing handlers to check single-node mode
 async fn echo_image(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -398,15 +455,19 @@ async fn echo_image(
 ) -> impl IntoResponse {
     let image_size = body.len();
     
+    // Update cluster state and check for single-node mode
+    let is_single_node = check_single_node_mode(&state).await;
+    
     // Check if this is a forwarded request from the leader
     let is_forwarded = headers.contains_key("x-raft-forwarded");
     
-    // Check if we're the leader
+    // Check if we're the leader OR in single-node mode
     let metrics = state.raft.metrics().borrow().clone();
     let is_leader = matches!(metrics.state, ServerState::Leader);
+    let can_process = is_leader || is_single_node;
     
-    // Followers only accept forwarded requests, not direct client requests
-    if !is_leader && !is_forwarded {
+    // In single-node mode, we can process requests directly
+    if !can_process && !is_forwarded {
         println!("🚫 Node {} (follower) dropping direct echo request - only leader processes direct requests", state.node_id);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -415,9 +476,13 @@ async fn echo_image(
         ).into_response();
     }
     
-    // If forwarded request and we're a follower, process it
-    if !is_leader && is_forwarded {
-        println!("📥 Node {} (follower) processing forwarded echo request: {} bytes", state.node_id, image_size);
+    // If we can process (leader or single-node mode) and it's not forwarded, or if it's forwarded to follower
+    if (!can_process && is_forwarded) || (can_process && !is_forwarded) {
+        println!("📥 Node {} ({}) processing {} echo request: {} bytes", 
+                state.node_id,
+                if is_single_node { "single-node" } else if is_leader { "leader" } else { "follower" },
+                if is_forwarded { "forwarded" } else { "direct" },
+                image_size);
         println!("📤 Echoing back {} bytes", image_size);
         return (
             StatusCode::OK,
@@ -429,7 +494,7 @@ async fn echo_image(
         ).into_response();
     }
     
-    // Leader: randomly assign to a node (including self)
+    // Leader in multi-node mode: randomly assign to a node (including self)
     let (target_id, target_addr) = match get_random_node(&state).await {
         Some(addr) => addr,
         None => {
@@ -512,22 +577,27 @@ pub struct SteganographyResponse {
     pub image: Vec<u8>,  // Stego image in PNG format
 }
 
+// Similarly modify steg_image and decrypt_image functions:
+
 async fn steg_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    // Start measuring TOTAL request latency (includes HTTP overhead, selection logic, etc.)
     let request_start = std::time::Instant::now();
     let image_size = body.len();
+    
+    // Update cluster state and check for single-node mode
+    let is_single_node = check_single_node_mode(&state).await;
     
     // Check Raft state first
     let metrics = state.raft.metrics().borrow().clone();
     let is_leader = matches!(metrics.state, ServerState::Leader);
     let is_forwarded = headers.contains_key("x-raft-forwarded");
+    let can_process = is_leader || is_single_node;
     
-    println!("📨 steg_image: Node {} (is_leader={}, is_forwarded={}) received {} bytes", 
-             state.node_id, is_leader, is_forwarded, image_size);
+    println!("📨 steg_image: Node {} (is_leader={}, single_node_mode={}, is_forwarded={}) received {} bytes", 
+             state.node_id, is_leader, is_single_node, is_forwarded, image_size);
     
     // Check if image is too large (max 10MB for safety)
     if image_size > 10_485_760 {
@@ -538,8 +608,8 @@ async fn steg_image(
         ).into_response();
     }
     
-    // Followers only accept forwarded requests, not direct client requests
-    if !is_leader && !is_forwarded {
+    // In single-node mode, we can process requests directly
+    if !can_process && !is_forwarded {
         println!("🚫 Node {} (follower) dropping direct steg request - only leader processes direct requests", state.node_id);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -548,12 +618,17 @@ async fn steg_image(
         ).into_response();
     }
     
-    // If forwarded request and we're a follower, process it
-    if !is_leader && is_forwarded {
-        println!("📥 Node {} (follower) processing forwarded steg request: {} bytes", state.node_id, image_size);
+    // If we can process (leader or single-node mode) and it's not forwarded, or if it's forwarded to follower
+    if (!can_process && is_forwarded) || (can_process && !is_forwarded) {
+        println!("📥 Node {} ({}) processing {} steg request: {} bytes", 
+                state.node_id,
+                if is_single_node { "single-node" } else if is_leader { "leader" } else { "follower" },
+                if is_forwarded { "forwarded" } else { "direct" },
+                image_size);
         println!("🔐 Starting steganography embedding...");
         println!("🔒 Encrypting and embedding image...");
-        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
+        
+        // Spawn CPU-intensive image processing in blocking task
         let body_clone = body.clone();
         let node_id = state.node_id;
         match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
@@ -591,6 +666,8 @@ async fn steg_image(
             }
         }
     }
+    
+    
     
     // Leader: randomly assign to a node (including self)
     println!("👉 Leader {} calling get_random_node()...", state.node_id);
