@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 pub type NodeId = u64;
 pub type RaftNode = Raft<TypeConfig>;
 
+
 /// Application state shared across HTTP handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -27,6 +28,27 @@ pub struct AppState {
     pub self_http_addr: String,
     pub healthy_nodes: Arc<RwLock<BTreeMap<NodeId, bool>>>, // Track which nodes are healthy
 }
+
+
+use crate::single_node_monitor;  // ADD THIS AT THE TOP
+
+/// Start background monitoring tasks for single-node operation
+pub fn start_monitors(state: AppState) {
+    let state_arc = Arc::new(state.clone());
+    
+    // Start single-node monitor
+    let state_clone = Arc::clone(&state_arc);
+    tokio::spawn(async move {
+        crate::single_node_monitor::monitor_single_node(state_clone).await;
+    });
+    
+    // Start new-node monitor
+    let state_clone = Arc::clone(&state_arc);
+    tokio::spawn(async move {
+        crate::single_node_monitor::monitor_new_nodes(state_clone).await;
+    });
+}
+
 
 /// Request to initialize the cluster
 #[derive(Debug, Serialize, Deserialize)]

@@ -4,6 +4,7 @@ mod network;
 mod api;
 mod rpc;
 mod rpc_handler;
+mod single_node_monitor;  // ADD THIS LINE
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -224,6 +225,8 @@ async fn main() -> Result<()> {
         self_http_addr: normalized_self_http,
         healthy_nodes: Arc::new(tokio::sync::RwLock::new(healthy_nodes)),
     };
+
+    api::start_monitors(app_state.clone());
 
     let app = api::create_router(app_state);
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
