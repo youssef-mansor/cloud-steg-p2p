@@ -15,12 +15,12 @@ Run this on machine **10.7.57.143**:
 cd raft-openraft-demo
 cargo run --release -- \
   --id 1 \
-  --http-addr 0.0.0.0:8001 \
-  --rpc-addr 0.0.0.0:7001 \
+  --http-addr 10.7.57.143:8001 \
+  --rpc-addr 10.7.57.143:7001 \
   --peers "2=10.7.57.109:7002,3=10.7.57.155:7003"
 ```
 
-**Wait for:** `🌐 HTTP API listening on 0.0.0.0:8001`
+**Wait for:** `🌐 HTTP API listening on 10.7.57.143:8001`
 
 ---
 
@@ -32,12 +32,12 @@ Run this on machine **10.7.57.109**:
 cd raft-openraft-demo
 cargo run --release -- \
   --id 2 \
-  --http-addr 0.0.0.0:8002 \
-  --rpc-addr 0.0.0.0:7002 \
+  --http-addr 10.7.57.109:8002 \
+  --rpc-addr 10.7.57.109:7002 \
   --peers "1=10.7.57.143:7001,3=10.7.57.155:7003"
 ```
 
-**Wait for:** `🌐 HTTP API listening on 0.0.0.0:8002`
+**Wait for:** `🌐 HTTP API listening on 10.7.57.109:8002`
 
 ---
 
@@ -49,12 +49,12 @@ Run this on machine **10.7.57.155**:
 cd raft-openraft-demo
 cargo run --release -- \
   --id 3 \
-  --http-addr 0.0.0.0:8003 \
-  --rpc-addr 0.0.0.0:7003 \
+  --http-addr 10.7.57.155:8003 \
+  --rpc-addr 10.7.57.155:7003 \
   --peers "1=10.7.57.143:7001,2=10.7.57.109:7002"
 ```
 
-**Wait for:** `🌐 HTTP API listening on 0.0.0.0:8003`
+**Wait for:** `🌐 HTTP API listening on 10.7.57.155:8003`
 
 ---
 
@@ -77,17 +77,17 @@ python3 test_load_balancing_threaded.py
 
 ### From 10.7.57.143:
 ```bash
-cargo run --release -- --id 1 --http-addr 0.0.0.0:8001 --rpc-addr 0.0.0.0:7001 --peers "2=10.7.57.109:7002,3=10.7.57.155:7003"
+cargo run --release -- --id 1 --http-addr 10.7.57.143:8001 --rpc-addr 10.7.57.143:7001 --peers "2=10.7.57.109:7002,3=10.7.57.155:7003"
 ```
 
 ### From 10.7.57.109:
 ```bash
-cargo run --release -- --id 2 --http-addr 0.0.0.0:8002 --rpc-addr 0.0.0.0:7002 --peers "1=10.7.57.143:7001,3=10.7.57.155:7003"
+cargo run --release -- --id 2 --http-addr 10.7.57.109:8002 --rpc-addr 10.7.57.109:7002 --peers "1=10.7.57.143:7001,3=10.7.57.155:7003"
 ```
 
 ### From 10.7.57.155:
 ```bash
-cargo run --release -- --id 3 --http-addr 0.0.0.0:8003 --rpc-addr 0.0.0.0:7003 --peers "1=10.7.57.143:7001,2=10.7.57.109:7002"
+cargo run --release -- --id 3 --http-addr 10.7.57.155:8003 --rpc-addr 10.7.57.155:7003 --peers "1=10.7.57.143:7001,2=10.7.57.109:7002"
 ```
 
 ---
