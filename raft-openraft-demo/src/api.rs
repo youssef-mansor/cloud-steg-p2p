@@ -642,7 +642,10 @@ async fn steg_image(
                 
                 return (
                     StatusCode::OK,
-                    [("Content-Type", "application/json")],
+                    [
+                        ("Content-Type", "application/json"),
+                        ("X-Processed-By-Node", &format!("{}", node_id)),
+                    ],
                     axum::body::Body::from(
                         format!(r#"{{"key": "{}", "image": "{}"}}"#, key_hex, image_base64)
                     ),
@@ -724,7 +727,10 @@ async fn steg_image(
                 
                 (
                     StatusCode::OK,
-                    [("Content-Type", "application/json")],
+                    [
+                        ("Content-Type", "application/json"),
+                        ("X-Processed-By-Node", &format!("{}", node_id)),
+                    ],
                     axum::body::Body::from(
                         format!(r#"{{"key": "{}", "image": "{}"}}"#, key_hex, image_base64)
                     ),
