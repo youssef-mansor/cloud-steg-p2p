@@ -642,63 +642,70 @@ async fn steg_image(
         ).into_response();
     }
     
-    // If we can process (leader or single-node mode) and it's not forwarded, or if it's forwarded to follower
-    if (!can_process && is_forwarded) || (can_process && !is_forwarded) {
-        println!("📥 Node {} ({}) processing {} steg request: {} bytes", 
-                state.node_id,
-                if is_single_node { "single-node" } else if is_leader { "leader" } else { "follower" },
-                if is_forwarded { "forwarded" } else { "direct" },
-                image_size);
-        println!("🔐 Starting steganography embedding...");
-        println!("🔒 Encrypting and embedding image...");
+    // **FIX: Leader must call load balancing FIRST for direct requests**
+    // Only non-leaders/single-node can process directly without load balancing
+    if is_leader && !is_forwarded {
+        println!("👉 Leader {} calling get_random_node() for load balancing...", state.node_id);
+        let (target_id, target_addr) = match get_random_node(&state).await {
+            Some(addr) => addr,
+            None => {
+                println!("⚠️  No available nodes for forwarding, processing locally");
+                (state.node_id, state.self_http_addr.clone())
+            }
+        };
         
-        // Spawn CPU-intensive image processing in blocking task
-        let body_clone = body.clone();
-        let node_id = state.node_id;
-        match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
-            Ok(Ok((stego_bytes, key_hex))) => {
-                println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
-                         node_id, stego_bytes.len(), image_size);
-                println!("🔑 Encryption key: {}", key_hex);
-                
-                // Encode image as base64
-                let image_base64 = format!("data:image/png;base64,{}", base64_encode(&stego_bytes));
-                
-                return (
-                    StatusCode::OK,
-                    [
-                        ("Content-Type", "application/json"),
-                        ("X-Processed-By-Node", &format!("{}", node_id)),
-                    ],
-                    axum::body::Body::from(
-                        format!(r#"{{"key": "{}", "image": "{}"}}"#, key_hex, image_base64)
-                    ),
-                ).into_response();
-            }
-            Ok(Err(e)) => {
-                eprintln!("❌ Node {} failed to embed image: {}", node_id, e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
-                ).into_response();
-            }
-            Err(e) => {
-                eprintln!("❌ Node {} task join error: {}", node_id, e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Task execution failed"}}"#),
-                ).into_response();
+        println!("🎯 Leader {} selected target node {} at addr {}", state.node_id, target_id, target_addr);
+        
+        if target_id == state.node_id {
+            // Will be processed below in the general processing block
+            println!("📥 Leader {} selected SELF by load balancing - will process locally", state.node_id);
+        } else {
+            // Forward to another node
+            println!("📤 Leader {} forwarding steg request to node {} at {}", state.node_id, target_id, target_addr);
+            let forward_start = std::time::Instant::now();
+            match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
+                Ok(response) => {
+                    let elapsed_ms = forward_start.elapsed().as_millis() as u64;
+                    
+                    // Update latency statistics
+                    let mut latencies = state.node_latencies.write().await;
+                    let stats = latencies.entry(target_id).or_insert(LatencyStats {
+                        total_ms: 0,
+                        count: 0,
+                    });
+                    stats.total_ms += elapsed_ms;
+                    stats.count += 1;
+                    drop(latencies);
+                    
+                    // Update throughput
+                    let mut throughput = state.node_throughput.write().await;
+                    let tp = throughput.entry(target_id).or_insert(ThroughputStats {
+                        completed_requests: 0,
+                        throughput_req_per_sec: 0.0,
+                    });
+                    tp.completed_requests += 1;
+                    drop(throughput);
+                    
+                    println!("✅ Forwarded to node {} succeeded ({}ms)", target_id, elapsed_ms);
+                    return response;
+                }
+                Err(e) => {
+                    println!("❌ Forwarding to node {} failed: {}, falling back to local processing", target_id, e);
+                    // Mark node as unhealthy
+                    let mut healthy = state.healthy.write().await;
+                    healthy.insert(target_id, false);
+                    drop(healthy);
+                    // Fall through to process locally as fallback
+                }
             }
         }
     }
     
-    
-    
-    // Leader: randomly assign to a node (including self)
-    println!("👉 Leader {} calling get_random_node()...", state.node_id);
-    let (target_id, target_addr) = match get_random_node(&state).await {
+    // Process locally if:
+    // - Leader that selected itself OR failed to forward to another node
+    // - Single-node mode with direct request  
+    // - Follower receiving forwarded request
+    if (is_leader && !is_forwarded) || (is_single_node && !is_forwarded) || (!can_process && is_forwarded) {
         Some(addr) => addr,
         None => {
             println!("⚠️  No available nodes for forwarding, processing locally");
@@ -1011,6 +1018,41 @@ async fn decrypt_image(
             [("Content-Type", "application/json")],
             format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
         ).into_response();
+    }
+    
+    // **FIX: Leader must call load balancing FIRST for direct decrypt requests**
+    if is_leader && !is_forwarded {
+        println!("👉 Leader {} calling get_random_node() for load balancing decrypt...", state.node_id);
+        let (target_id, target_addr) = match get_random_node(&state).await {
+            Some(addr) => addr,
+            None => {
+                println!("⚠️  No available nodes for forwarding, processing locally");
+                (state.node_id, state.self_http_addr.clone())
+            }
+        };
+        
+        println!("🎯 Leader {} selected target node {} at addr {}", state.node_id, target_id, target_addr);
+        
+        if target_id == state.node_id {
+            println!("📥 Leader {} selected SELF by load balancing - will process locally", state.node_id);
+        } else {
+            // Forward to another node
+            println!("📤 Leader {} forwarding decrypt request to node {} at {}", state.node_id, target_id, target_addr);
+            let forward_url = format!("/image/decrypt?key={}", urlencoding::encode(&params.key));
+            match forward_request_to_node(target_id, &target_addr, &forward_url, &body).await {
+                Ok(response) => {
+                    println!("✅ Forwarded decrypt to node {} succeeded", target_id);
+                    return response;
+                }
+                Err(e) => {
+                    println!("❌ Forwarding decrypt to node {} failed: {}, falling back to local processing", target_id, e);
+                    // Mark node as unhealthy and fall through
+                    let mut healthy = state.healthy.write().await;
+                    healthy.insert(target_id, false);
+                    drop(healthy);
+                }
+            }
+        }
     }
     
     // If forwarded request and we're a follower, process it
