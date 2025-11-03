@@ -101,6 +101,25 @@ async fn check_single_node_mode(state: &AppState) -> bool {
     println!("🔍 Cluster state: {} healthy nodes out of {} total - single node mode: {}", 
              healthy_count, total_nodes, is_single_node);
     
+    // If in single-node mode and not a leader, initialize as single-node cluster
+    if is_single_node {
+        let metrics = state.raft.metrics().borrow().clone();
+        let is_leader = matches!(metrics.state, ServerState::Leader);
+        
+        if !is_leader {
+            println!("🏝️  Single-node mode detected - initializing as single-node cluster");
+            let mut nodes = std::collections::BTreeMap::new();
+            nodes.insert(state.node_id, ());
+            
+            // Initialize Raft with just this node
+            if let Err(e) = state.raft.initialize(nodes).await {
+                println!("⚠️  Failed to initialize single-node cluster: {:?}", e);
+            } else {
+                println!("✅ Successfully initialized as single-node cluster (will become leader)");
+            }
+        }
+    }
+    
     is_single_node
 }
 
