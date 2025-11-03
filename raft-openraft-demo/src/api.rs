@@ -853,7 +853,11 @@ async fn steg_image(
         image: image_base64,
     };
     
-    return (StatusCode::OK, axum::Json(response)).into_response();
+    return (
+        StatusCode::OK,
+        [("X-Processed-By-Node", format!("{}", state.node_id).as_str())],
+        axum::Json(response)
+    ).into_response();
     } else {
         // Should not reach here, but handle for safety
         return (
