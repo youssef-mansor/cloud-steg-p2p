@@ -493,8 +493,8 @@ async fn steg_image(
                 let processed_by = response.headers()
                     .get("x-processed-by-node")
                     .and_then(|h| h.to_str().ok())
-                    .unwrap_or_else(|| &format!("{}", target_id))
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{}", target_id));
                 
                 match response.bytes().await {
                     Ok(bytes) => {
