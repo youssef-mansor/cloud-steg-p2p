@@ -643,9 +643,14 @@ async fn steg_image(
         ).into_response();
     }
     
+    // In single-node mode, skip load balancing and process locally
+    if is_single_node && !is_forwarded {
+        println!("🏝️  Single-node mode: Node {} processing request locally (no Raft consensus needed)", state.node_id);
+    }
+    
     // **FIX: Leader must call load balancing FIRST for direct requests**
-    // Only non-leaders/single-node can process directly without load balancing
-    if is_leader && !is_forwarded {
+    // Skip load balancing in single-node mode - process locally
+    if is_leader && !is_forwarded && !is_single_node {
         println!("👉 Leader {} calling get_random_node() for load balancing...", state.node_id);
         let (target_id, target_addr) = match get_random_node(&state).await {
             Some(addr) => addr,
@@ -882,13 +887,17 @@ async fn decrypt_image(
 ) -> impl IntoResponse {
     let image_size = body.len();
     
+    // Update cluster state and check for single-node mode
+    let is_single_node = check_single_node_mode(&state).await;
+    
     // Check Raft state first
     let metrics = state.raft.metrics().borrow().clone();
     let is_leader = matches!(metrics.state, ServerState::Leader);
     let is_forwarded = headers.contains_key("x-raft-forwarded");
+    let can_process = is_leader || is_single_node;
     
-    println!("📨 decrypt_image: Node {} (is_leader={}, is_forwarded={}) received {} bytes", 
-             state.node_id, is_leader, is_forwarded, image_size);
+    println!("📨 decrypt_image: Node {} (is_leader={}, single_node_mode={}, is_forwarded={}) received {} bytes", 
+             state.node_id, is_leader, is_single_node, is_forwarded, image_size);
     
     // Check if image is too large (max 10MB for safety)
     if image_size > 10_485_760 {
@@ -900,7 +909,7 @@ async fn decrypt_image(
     }
     
     // Followers only accept forwarded requests, not direct client requests
-    if !is_leader && !is_forwarded {
+    if !can_process && !is_forwarded {
         println!("🚫 Node {} (follower) dropping direct decrypt request - only leader processes direct requests", state.node_id);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -909,8 +918,13 @@ async fn decrypt_image(
         ).into_response();
     }
     
+    // In single-node mode, skip load balancing and process locally
+    if is_single_node && !is_forwarded {
+        println!("🏝️  Single-node mode: Node {} processing decrypt request locally (no Raft consensus needed)", state.node_id);
+    }
+    
     // **FIX: Leader must call load balancing FIRST for direct decrypt requests**
-    if is_leader && !is_forwarded {
+    if is_leader && !is_forwarded && !is_single_node {
         println!("👉 Leader {} calling get_random_node() for load balancing decrypt...", state.node_id);
         let (target_id, target_addr) = match get_random_node(&state).await {
             Some(addr) => addr,
