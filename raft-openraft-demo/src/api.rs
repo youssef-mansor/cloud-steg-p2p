@@ -378,15 +378,31 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
         let mut weighted_nodes: Vec<(NodeId, f64)> = Vec::new();
         let mut total_weight: f64 = 0.0;
         
+        // Calculate average throughput to set a baseline
+        let mut sum_throughput = 0.0;
+        let mut count = 0;
+        for node_id in &healthy_node_ids {
+            let tp = throughput
+                .get(node_id)
+                .map(|s| s.throughput_req_per_sec)
+                .unwrap_or(0.0);
+            sum_throughput += tp;
+            count += 1;
+        }
+        let avg_throughput = if count > 0 { sum_throughput / count as f64 } else { 1.0 };
+        // Use minimum of 5 req/s or average throughput as baseline to ensure new nodes get work
+        let baseline_throughput = avg_throughput.max(5.0);
+        
         for node_id in &healthy_node_ids {
             let throughput_req_per_sec = throughput
                 .get(node_id)
                 .map(|s| s.throughput_req_per_sec)
-                .unwrap_or(1.0); // Default 1 req/s if no data yet
+                .unwrap_or(0.0);
             
-            // Weight = throughput (higher throughput = higher weight = more requests)
-            // Add small offset to avoid division by zero
-            let weight = throughput_req_per_sec + 0.1;
+            // Weight = baseline + actual throughput
+            // This ensures nodes with zero throughput still get a fair baseline weight
+            // while allowing better performing nodes to get proportionally more work
+            let weight = baseline_throughput + throughput_req_per_sec;
             weighted_nodes.push((*node_id, weight));
             total_weight += weight;
         }
@@ -401,11 +417,13 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
                 } else {
                     http_addrs.get(&node_id)?.clone()
                 };
-                let throughput_str = throughput
+                let actual_throughput = throughput
                     .get(&node_id)
-                    .map(|s| format!("{:.1} req/s", s.throughput_req_per_sec))
-                    .unwrap_or("unknown".to_string());
-                println!("🎯 THROUGHPUT-WEIGHTED: Selected node {} (throughput: {})", node_id, throughput_str);
+                    .map(|s| s.throughput_req_per_sec)
+                    .unwrap_or(0.0);
+                let selection_probability = (weight / total_weight) * 100.0;
+                println!("🎯 THROUGHPUT-WEIGHTED: Selected node {} (throughput: {:.1} req/s, weight: {:.1}, probability: {:.1}%)", 
+                         node_id, actual_throughput, weight, selection_probability);
                 return Some((node_id, addr));
             }
         }

@@ -224,10 +224,106 @@ Client Request → Axum Router → Handler (async)
 - Faster nodes naturally receive more load
 - Enables automatic adaptation to cluster performance variations
 
+**Note:** This section describes the previous latency-based implementation. The current implementation uses **throughput-based load balancing** (see below).
+
+### Throughput-Based Load Balancing (Current Implementation)
+
+**Strategy:**
+- Leader tracks actual throughput (requests/second) for each node
+- Uses **baseline + throughput weighting** to distribute load fairly
+- Ensures new or idle nodes still receive work while rewarding high performers
+- Automatically adapts to cluster performance variations
+
 **Implementation:**
 
 ```rust
-// Track latency statistics per node
+// Track throughput statistics per node
+pub struct ThroughputStats {
+    pub completed_requests: u64,     // Requests in current period
+    pub throughput_req_per_sec: f64, // Calculated throughput
+}
+
+// Periodic recalculation (every 1 second)
+stats.throughput_req_per_sec = stats.completed_requests as f64;
+stats.completed_requests = 0; // Reset for next period
+
+// Load balancing with throughput weighting
+async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
+    let throughput = state.node_throughput.read().await;
+    
+    // Calculate average throughput across healthy nodes
+    let avg_throughput = sum_throughput / healthy_nodes.len();
+    // Use minimum of 5 req/s or average as baseline
+    let baseline_throughput = avg_throughput.max(5.0);
+    
+    // Calculate weighted selection based on baseline + actual throughput
+    for node_id in &healthy_nodes {
+        let actual_throughput = throughput
+            .get(node_id)
+            .map(|s| s.throughput_req_per_sec)
+            .unwrap_or(0.0);
+        
+        // Weight = baseline + actual throughput
+        // Ensures nodes with zero throughput still get fair baseline weight
+        // Better performers get proportionally more work
+        let weight = baseline_throughput + actual_throughput;
+        weighted_nodes.push((node_id, weight));
+        total_weight += weight;
+    }
+    
+    // Select node based on weighted probability
+    let mut rand_val = random::<f64>() * total_weight;
+    for (node_id, weight) in weighted_nodes {
+        rand_val -= weight;
+        if rand_val <= 0.0 {
+            return Some((node_id, addr));
+        }
+    }
+}
+
+// Record throughput on each successful request
+tp_stats.completed_requests += 1;
+```
+
+**Example Behavior:**
+
+Scenario: 3 nodes just started (all have 0 throughput initially)
+- Baseline: 5.0 req/s
+- Node 1: 0 req/s → weight = 5.0 + 0 = 5.0
+- Node 2: 0 req/s → weight = 5.0 + 0 = 5.0
+- Node 3: 0 req/s → weight = 5.0 + 0 = 5.0
+
+**Initial selection probability:**
+- Node 1: 33% (5.0/15.0)
+- Node 2: 33% (5.0/15.0)
+- Node 3: 33% (5.0/15.0)
+
+After some requests (Node 1 is faster):
+- Baseline: 5.0 req/s (or higher if avg throughput increases)
+- Node 1: 10 req/s → weight = 5.0 + 10 = 15.0
+- Node 2: 5 req/s → weight = 5.0 + 5 = 10.0
+- Node 3: 3 req/s → weight = 5.0 + 3 = 8.0
+
+**Adapted selection probability:**
+- Node 1 (fast): 45% (15.0/33.0)
+- Node 2 (medium): 30% (10.0/33.0)
+- Node 3 (slow): 24% (8.0/33.0)
+
+**Benefits:**
+- ✅ New nodes immediately get fair share (equal baseline)
+- ✅ No "cold start" problem - zero-throughput nodes still get work
+- ✅ Faster nodes naturally receive more load as they prove themselves
+- ✅ Slow nodes still get baseline share (not starved)
+- ✅ Automatic performance adaptation
+- ✅ No manual configuration required
+- ✅ Responds dynamically to performance changes
+
+**Old Implementation (Latency-Based):**
+
+**Old Implementation (Latency-Based):**
+
+```rust
+// Track latency statistics per node (kept for monitoring)
 pub struct LatencyStats {
     pub total_ms: u64,   // Cumulative latency
     pub count: u64,      // Number of samples
@@ -238,78 +334,12 @@ impl LatencyStats {
         if self.count == 0 { 0.0 } else { self.total_ms as f64 / self.count as f64 }
     }
 }
-
-// Load balancing with latency weighting
-async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
-    let latencies = state.node_latencies.read().await;
-    
-    // Calculate weighted selection based on inverse latency
-    let mut weighted_nodes: Vec<(NodeId, f64)> = Vec::new();
-    let mut total_weight: f64 = 0.0;
-    
-    for node_id in &healthy_non_self_nodes {
-        let latency_ms = latencies
-            .get(node_id)
-            .map(|s| s.average_ms())
-            .unwrap_or(50.0);  // Default 50ms if no data
-        
-        // Weight = 1 / latency, so faster nodes get higher weight
-        let weight = 1.0 / (latency_ms + 1.0);
-        weighted_nodes.push((*node_id, weight));
-        total_weight += weight;
-    }
-    
-    // Select node based on weighted probability
-    let mut rand_val = (random::<f64>()) * total_weight;
-    for (node_id, weight) in weighted_nodes {
-        rand_val -= weight;
-        if rand_val <= 0.0 {
-            println!("🎯 LATENCY-WEIGHTED: Selected node {} (avg latency: {:.1}ms)", 
-                     node_id, latencies.get(&node_id)?.average_ms());
-            return Some((node_id, http_addrs.get(&node_id)?.clone()));
-        }
-    }
-    
-    Some((node_id, addr))
-}
-
-// Record latency on each request
-let start_time = std::time::Instant::now();
-match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
-    Ok(response) => {
-        let elapsed_ms = start_time.elapsed().as_millis() as u64;
-        
-        // Update latency statistics
-        let mut latencies = state.node_latencies.write().await;
-        let stats = latencies.entry(target_id).or_insert(LatencyStats {
-            total_ms: 0,
-            count: 0,
-        });
-        stats.total_ms += elapsed_ms;
-        stats.count += 1;
-    }
-}
 ```
 
-**Example Behavior:**
-
-With 3 nodes and these latencies:
-- Node 1: 50ms → weight = 1/51 ≈ 0.020
-- Node 2: 100ms → weight = 1/101 ≈ 0.010  
-- Node 3: 200ms → weight = 1/201 ≈ 0.005
-
-**Selection probability:**
-- Node 1 (fast): 51% of requests
-- Node 2 (medium): 25% of requests
-- Node 3 (slow): 13% of requests
-- (Remaining 11% to leader for local processing)
-
-**Benefits:**
-- ✅ Automatic performance adaptation
-- ✅ Faster nodes handle more load naturally
-- ✅ Slow nodes gracefully receive fewer requests
-- ✅ No manual configuration required
-- ✅ Responds dynamically to network changes
+The old latency-based approach had issues:
+- ❌ Nodes with initially high latency could get starved
+- ❌ Inverse weighting could create feedback loops
+- ❌ Less intuitive than throughput-based selection
 
 ### CPU-Intensive Operations
 
@@ -403,23 +433,44 @@ loop {
 - ❌ Leader becomes bottleneck (mitigated by forwarding)
 - ❌ Followers waste CPU rejecting requests (minimal - quick 503)
 
-### 3. Random Load Balancing
+### 3. Throughput-Based Load Balancing
 
-**Decision:** Leader randomly selects healthy nodes (including self) for processing
+**Decision:** Leader uses throughput-based weighted selection for healthy nodes (including self)
 
 **Rationale:**
-- **Simplicity**: No complex algorithms needed
-- **Fair Distribution**: Random selection ensures roughly equal distribution
-- **Flexibility**: Easy to exclude unhealthy nodes
+- **Fair Initial Distribution**: Baseline weight ensures new/idle nodes get work
+- **Performance Adaptation**: Higher throughput nodes naturally get more requests
+- **No Cold Start Problem**: Zero-throughput nodes still participate
+- **Simple & Effective**: Easy to understand and implement
 
 **Implementation:**
 ```rust
-// Filters to healthy nodes only
-let healthy_nodes = http_addrs.iter()
-    .filter(|(id, _)| healthy.get(id).unwrap_or(false))
-    .collect();
-let selected = random() % healthy_nodes.len();
+// Calculate baseline (minimum 5 req/s or cluster average)
+let baseline = avg_throughput.max(5.0);
+
+// Weight each node: baseline + actual throughput
+for node_id in healthy_nodes {
+    let actual = get_throughput(node_id).unwrap_or(0.0);
+    let weight = baseline + actual;  // e.g., 5.0 + 0.0 = 5.0 for new node
+    weighted_nodes.push((node_id, weight));
+}
+
+// Weighted random selection
+let selected = weighted_random(weighted_nodes);
 ```
+
+**Why This Works:**
+- **New nodes**: weight = 5.0 + 0.0 = 5.0 (get fair share)
+- **Fast nodes**: weight = 5.0 + 10.0 = 15.0 (get 3x more)
+- **Slow nodes**: weight = 5.0 + 2.0 = 7.0 (still get baseline)
+
+**Trade-offs:**
+- ✅ Fair distribution for new nodes
+- ✅ Rewards high performers
+- ✅ No node starvation
+- ✅ Adapts to performance changes
+- ✅ Simple to tune (baseline parameter)
+- ⚠️ Requires 1-second measurement window to calculate throughput
 
 ### 4. Health Tracking with Probation
 
