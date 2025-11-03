@@ -149,7 +149,9 @@ export class RaftApiClient {
     }
   }
 
-  // Find the actual leader node
+  // Note: findLeader is no longer needed with multicast approach
+  // Keeping for reference in case it's needed in the future
+  /*
   private async findLeader(): Promise<number | null> {
     console.log('🔍 Detecting leader...');
     
@@ -178,8 +180,9 @@ export class RaftApiClient {
     console.log('⚠️  Could not detect leader from any node');
     return null;
   }
+  */
 
-  // Send image to any available node (load balanced)
+  // Send image to all nodes in parallel (multicast for load balancing)
   async uploadImageToCluster(imageFile: File): Promise<{
     success: boolean;
     data?: Blob;
@@ -189,28 +192,27 @@ export class RaftApiClient {
     processedBy?: number;
     latency: number;
   }> {
-    // Find the leader
-    const leaderId = await this.findLeader();
-
-    if (leaderId) {
-      console.log(`📤 Sending encryption request to leader Node ${leaderId}`);
-      const result = await this.uploadImageForEncryption(leaderId, imageFile);
-      if (result.success) {
-        return { ...result, nodeId: leaderId };
-      }
-      console.error(`❌ Leader Node ${leaderId} failed, trying other nodes...`);
-    }
-
-    // Fallback: try all nodes if leader is down or detection failed
-    console.log('⚠️  Trying all nodes as fallback...');
-    for (const node of this.nodes) {
-      if (node.id === leaderId) continue; // Skip leader if we already tried it
-      const result = await this.uploadImageForEncryption(node.id, imageFile);
-      if (result.success) {
-        return { ...result, nodeId: node.id };
+    console.log(`� Multicasting encryption request to all ${this.nodes.length} nodes in parallel...`);
+    
+    // Send to all nodes in parallel
+    const promises = this.nodes.map(node => 
+      this.uploadImageForEncryption(node.id, imageFile)
+    );
+    
+    const results = await Promise.allSettled(promises);
+    
+    // Find first successful response
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      if (result.status === 'fulfilled' && result.value.success) {
+        const nodeId = this.nodes[i].id;
+        console.log(`✅ Multicast succeeded! Node ${nodeId} processed the request`);
+        return { ...result.value, nodeId };
       }
     }
-
+    
+    // All nodes failed
+    console.error('❌ All nodes failed to process encryption request');
     return {
       success: false,
       error: 'All nodes failed',
@@ -218,7 +220,7 @@ export class RaftApiClient {
     };
   }
 
-  // Decrypt/Extract image from stego image - send to leader for load balancing
+  // Decrypt/Extract image from stego image - multicast to all nodes
   async decryptImageFromCluster(stegoFile: File, encryptionKey: string): Promise<{
     success: boolean;
     data?: Blob;
@@ -232,57 +234,7 @@ export class RaftApiClient {
     try {
       const arrayBuffer = await stegoFile.arrayBuffer();
       
-      // Find the leader
-      const leaderId = await this.findLeader();
-
-      if (leaderId) {
-        console.log(`📤 Sending decryption request to leader Node ${leaderId}`);
-        const leaderNode = this.nodes.find((n) => n.id === leaderId);
-        if (leaderNode) {
-          const nodeStartTime = performance.now();
-          const nodeController = new AbortController();
-          const nodeTimeoutId = setTimeout(() => nodeController.abort(), 30000); // 30 second timeout
-          
-          try {
-            const response = await fetch(
-              `${leaderNode.httpAddr}/image/decrypt?key=${encodeURIComponent(encryptionKey)}`,
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/octet-stream' },
-                body: arrayBuffer,
-                signal: nodeController.signal,
-              }
-            );
-
-            clearTimeout(nodeTimeoutId);
-            const nodeLatency = performance.now() - nodeStartTime;
-
-            if (response.ok) {
-              const processedByHeader = response.headers.get('X-Processed-By-Node');
-              const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : leaderId;
-
-              const arrayBufferResponse = await response.arrayBuffer();
-              const blob = new Blob([arrayBufferResponse], { type: 'image/png' });
-              console.log(`✅ Leader Node ${leaderId} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${nodeLatency.toFixed(0)}ms`);
-              
-              const totalLatency = performance.now() - startTime;
-              return { 
-                success: true, 
-                data: blob, 
-                nodeId: leaderId,
-                processedBy, 
-                latency: totalLatency 
-              };
-            }
-          } catch (error) {
-            clearTimeout(nodeTimeoutId);
-            console.error(`❌ Leader Node ${leaderId} failed:`, error);
-          }
-        }
-      }
-
-      // Fallback: try all nodes if leader detection failed or leader is down
-      console.log('⚠️  Leader detection failed or leader is down, trying all nodes');
+      console.log(`� Multicasting decryption request to all ${this.nodes.length} nodes in parallel...`);
       
       const results = await Promise.allSettled(
         this.nodes.map(async (node) => {
