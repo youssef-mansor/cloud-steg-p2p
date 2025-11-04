@@ -5,8 +5,10 @@ import { apiClient } from '../api/client';
 import type { NodeStats, TimeSeriesDataPoint } from '../types';
 
 export function ImageEncryptionTab() {
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [selectedCoverFile, setSelectedCoverFile] = useState<File | null>(null);
+  const [selectedSecretFile, setSelectedSecretFile] = useState<File | null>(null);
+  const [coverPreviewUrl, setCoverPreviewUrl] = useState<string | null>(null);
+  const [secretPreviewUrl, setSecretPreviewUrl] = useState<string | null>(null);
   const [encryptedBlob, setEncryptedBlob] = useState<Blob | null>(null);
   const [decryptedBlob, setDecryptedBlob] = useState<Blob | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -15,8 +17,8 @@ export function ImageEncryptionTab() {
   const [decryptingNode, setDecryptingNode] = useState<number | null>(null);
   const [latency, setLatency] = useState<number | null>(null);
   const [decryptLatency, setDecryptLatency] = useState<number | null>(null);
-  const [manualEncryptionKey, setManualEncryptionKey] = useState<string>('');
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const coverFileInputRef = useRef<HTMLInputElement>(null);
+  const secretFileInputRef = useRef<HTMLInputElement>(null);
   const stegoFileInputRef = useRef<HTMLInputElement>(null);
 
   // Stress test state
@@ -31,32 +33,45 @@ export function ImageEncryptionTab() {
   const [failureEvents, setFailureEvents] = useState<Array<{ time: number; node: number; event: string; requestNum: number }>>([]);
   const [stressTestDuration, setStressTestDuration] = useState<number | null>(null);
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleCoverFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    setSelectedFile(file);
+    setSelectedCoverFile(file);
     setEncryptedBlob(null);
     setLatency(null);
 
     // Create preview
     const reader = new FileReader();
-    reader.onload = () => setPreviewUrl(reader.result as string);
+    reader.onload = () => setCoverPreviewUrl(reader.result as string);
+    reader.readAsDataURL(file);
+  };
+
+  const handleSecretFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setSelectedSecretFile(file);
+    setEncryptedBlob(null);
+    setLatency(null);
+
+    // Create preview
+    const reader = new FileReader();
+    reader.onload = () => setSecretPreviewUrl(reader.result as string);
     reader.readAsDataURL(file);
   };
 
   const handleEncrypt = async () => {
-    if (!selectedFile) return;
+    if (!selectedCoverFile || !selectedSecretFile) return;
 
     setIsProcessing(true);
     setLatency(null);
 
     try {
-      const result = await apiClient.uploadImageToCluster(selectedFile);
+      const result = await apiClient.uploadImageToCluster(selectedCoverFile, selectedSecretFile);
 
-      if (result.success && result.data && result.key) {
+      if (result.success && result.data) {
         setEncryptedBlob(result.data);
-        setManualEncryptionKey(result.key);
         setProcessingNode(result.nodeId || null);
         setLatency(result.latency);
       } else {
@@ -83,35 +98,25 @@ export function ImageEncryptionTab() {
   };
 
   const handleDecrypt = async (stegoFile: File) => {
-    if (!manualEncryptionKey) {
-      alert('❌ Please enter the encryption key');
-      return;
-    }
-
-    if (!manualEncryptionKey.match(/^[0-9a-f]+$/i)) {
-      alert('❌ Encryption key must be in hexadecimal format (0-9 and a-f)');
-      return;
-    }
-
     setIsDecrypting(true);
     setDecryptLatency(null);
 
     try {
-      console.log(`🔓 Starting decryption with key length: ${manualEncryptionKey.length}`);
-      const result = await apiClient.decryptImageFromCluster(stegoFile, manualEncryptionKey);
+      console.log(`🔓 Starting extraction from stego image`);
+      const result = await apiClient.decryptImageFromCluster(stegoFile);
 
       if (result.success && result.data) {
         setDecryptedBlob(result.data);
         setDecryptingNode(result.nodeId || null);
         setDecryptLatency(result.latency);
-        console.log(`✅ Decryption succeeded on node ${result.nodeId}, latency: ${result.latency}ms`);
+        console.log(`✅ Extraction succeeded on node ${result.nodeId}, latency: ${result.latency}ms`);
       } else {
-        console.error(`❌ Decryption failed: ${result.error}`);
-        alert(`❌ Decryption failed:\n\n${result.error}\n\nPlease check:\n1. The encryption key is correct\n2. The stego image is intact\n3. At least one server node is running\n\nCheck browser console for more details.`);
+        console.error(`❌ Extraction failed: ${result.error}`);
+        alert(`❌ Extraction failed:\n\n${result.error}\n\nPlease check:\n1. The stego image is intact\n2. At least one server node is running\n\nCheck browser console for more details.`);
       }
     } catch (error) {
-      console.error('❌ Decryption error:', error);
-      alert(`❌ Error during decryption:\n\n${error instanceof Error ? error.message : String(error)}\n\nCheck browser console for more details.`);
+      console.error('❌ Extraction error:', error);
+      alert(`❌ Error during extraction:\n\n${error instanceof Error ? error.message : String(error)}\n\nCheck browser console for more details.`);
     } finally {
       setIsDecrypting(false);
     }
@@ -138,8 +143,8 @@ export function ImageEncryptionTab() {
   };
 
   const handleStressTest = async () => {
-    if (!selectedFile) {
-      alert('Please select an image first');
+    if (!selectedCoverFile || !selectedSecretFile) {
+      alert('Please select both cover and secret images first');
       return;
     }
 
@@ -312,7 +317,7 @@ export function ImageEncryptionTab() {
         for (let i = 0; i < requestsPerThread; i++) {
           try {
             // Send to cluster - leader will load balance
-            const result = await apiClient.uploadImageToCluster(selectedFile);
+            const result = await apiClient.uploadImageToCluster(selectedCoverFile, selectedSecretFile);
             const requestCompletionTime = Date.now();
             
             if (result.success && result.processedBy) {
@@ -443,34 +448,70 @@ export function ImageEncryptionTab() {
       <div className="bg-white rounded-lg shadow p-6">
         <h2 className="text-2xl font-bold mb-4">Image Encryption</h2>
 
-        {/* File Upload */}
-        <div className="mb-6">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            onChange={handleFileSelect}
-            className="hidden"
-          />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-          >
-            <Upload size={20} />
-            Select Image
-          </button>
-          {selectedFile && (
-            <p className="mt-2 text-sm text-gray-600">
-              Selected: {selectedFile.name} ({(selectedFile.size / 1024).toFixed(2)} KB)
-            </p>
-          )}
+        {/* File Uploads */}
+        <div className="mb-6 grid grid-cols-2 gap-6">
+          {/* Cover Image */}
+          <div>
+            <input
+              ref={coverFileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleCoverFileSelect}
+              className="hidden"
+            />
+            <button
+              onClick={() => coverFileInputRef.current?.click()}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 w-full justify-center"
+            >
+              <Upload size={20} />
+              Select Cover Image
+            </button>
+            {selectedCoverFile && (
+              <p className="mt-2 text-sm text-gray-600">
+                Cover: {selectedCoverFile.name} ({(selectedCoverFile.size / 1024).toFixed(2)} KB)
+              </p>
+            )}
+          </div>
+
+          {/* Secret Image */}
+          <div>
+            <input
+              ref={secretFileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleSecretFileSelect}
+              className="hidden"
+            />
+            <button
+              onClick={() => secretFileInputRef.current?.click()}
+              className="flex items-center gap-2 px-4 py-2 bg-purple-500 text-white rounded hover:bg-purple-600 w-full justify-center"
+            >
+              <Upload size={20} />
+              Select Secret Image
+            </button>
+            {selectedSecretFile && (
+              <p className="mt-2 text-sm text-gray-600">
+                Secret: {selectedSecretFile.name} ({(selectedSecretFile.size / 1024).toFixed(2)} KB)
+              </p>
+            )}
+          </div>
         </div>
 
         {/* Preview */}
-        {previewUrl && (
-          <div className="mb-6">
-            <h3 className="font-semibold mb-2">Original Image</h3>
-            <img src={previewUrl} alt="Preview" className="max-w-md border rounded" />
+        {(coverPreviewUrl || secretPreviewUrl) && (
+          <div className="mb-6 grid grid-cols-2 gap-6">
+            {coverPreviewUrl && (
+              <div>
+                <h3 className="font-semibold mb-2">Cover Image</h3>
+                <img src={coverPreviewUrl} alt="Cover Preview" className="w-full border rounded" />
+              </div>
+            )}
+            {secretPreviewUrl && (
+              <div>
+                <h3 className="font-semibold mb-2">Secret Image (to hide)</h3>
+                <img src={secretPreviewUrl} alt="Secret Preview" className="w-full border rounded" />
+              </div>
+            )}
           </div>
         )}
 
@@ -478,7 +519,7 @@ export function ImageEncryptionTab() {
         <div className="mb-6">
           <button
             onClick={handleEncrypt}
-            disabled={!selectedFile || isProcessing}
+            disabled={!selectedCoverFile || !selectedSecretFile || isProcessing}
             className="flex items-center gap-2 px-6 py-3 bg-green-500 text-white rounded hover:bg-green-600 disabled:bg-gray-300 disabled:cursor-not-allowed"
           >
             {isProcessing ? (
@@ -487,7 +528,7 @@ export function ImageEncryptionTab() {
                 Encrypting...
               </>
             ) : (
-              <>Encrypt & Get Steganography Image</>
+              <>Embed Secret into Cover Image</>
             )}
           </button>
         </div>
@@ -499,61 +540,26 @@ export function ImageEncryptionTab() {
             <p className="text-sm text-gray-600 mb-2">
               Processed by Node {processingNode} • Latency: {latency?.toFixed(0)}ms
             </p>
-            
-            {/* Display Encryption Key */}
-            {manualEncryptionKey && (
-              <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded">
-                <p className="text-sm font-semibold text-yellow-800 mb-2">🔑 Encryption Key (Save this!)</p>
-                <div className="flex items-center gap-2">
-                  <code className="flex-1 p-2 bg-white border rounded text-xs font-mono break-all">
-                    {manualEncryptionKey}
-                  </code>
-                  <button
-                    onClick={() => {
-                      navigator.clipboard.writeText(manualEncryptionKey);
-                      alert('Key copied to clipboard!');
-                    }}
-                    className="px-3 py-1 bg-yellow-600 text-white rounded text-sm hover:bg-yellow-700"
-                  >
-                    Copy
-                  </button>
-                </div>
-              </div>
-            )}
+            <p className="text-sm text-gray-600 mb-4">
+              Your secret image has been embedded into the cover image. Download the stego image below.
+            </p>
             
             <button
               onClick={handleDownload}
               className="flex items-center gap-2 px-4 py-2 bg-purple-500 text-white rounded hover:bg-purple-600"
             >
               <Download size={20} />
-              Download Encrypted Image
+              Download Stego Image
             </button>
           </div>
         )}
 
         {/* Decrypt Section */}
         <div className="mt-8 pt-8 border-t">
-          <h2 className="text-xl font-bold mb-4">Decryption</h2>
+          <h2 className="text-xl font-bold mb-4">Extraction</h2>
           <p className="text-sm text-gray-600 mb-4">
-            Upload a stego image and provide the encryption key to extract the hidden data
+            Upload a stego image to extract the hidden secret image
           </p>
-
-          {/* Encryption Key Input */}
-          <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded">
-            <label className="block text-sm font-semibold text-blue-900 mb-2">
-              🔑 Encryption Key (Required for Decryption)
-            </label>
-            <textarea
-              value={manualEncryptionKey}
-              onChange={(e) => setManualEncryptionKey(e.target.value)}
-              placeholder="Paste the encryption key from your encryption here..."
-              className="w-full p-2 border rounded font-mono text-sm"
-              rows={3}
-            />
-            <p className="text-xs text-blue-700 mt-2">
-              If you just encrypted an image above, the key is automatically populated here.
-            </p>
-          </div>
 
           {/* File Input for Decryption */}
           <div className="mb-6">
@@ -566,27 +572,27 @@ export function ImageEncryptionTab() {
             />
             <button
               onClick={() => stegoFileInputRef.current?.click()}
-              disabled={isDecrypting || !manualEncryptionKey}
+              disabled={isDecrypting}
               className="flex items-center gap-2 px-6 py-3 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed"
             >
               {isDecrypting ? (
                 <>
                   <Loader2 size={20} className="animate-spin" />
-                  Decrypting...
+                  Extracting...
                 </>
               ) : (
                 <>
                   <Upload size={20} />
-                  Select Stego Image to Decrypt
+                  Select Stego Image to Extract From
                 </>
               )}
             </button>
           </div>
 
-          {/* Decrypt Button */}
+          {/* Decrypt Results */}
           {decryptedBlob && (
             <div className="border rounded p-4 bg-blue-50">
-              <h3 className="font-semibold mb-2 text-blue-600">✓ Decryption Complete</h3>
+              <h3 className="font-semibold mb-2 text-blue-600">✓ Extraction Complete</h3>
               <p className="text-sm text-gray-600 mb-2">
                 Processed by Node {decryptingNode} • Latency: {decryptLatency?.toFixed(0)}ms
               </p>
@@ -672,7 +678,7 @@ export function ImageEncryptionTab() {
         <div className="flex gap-4 mb-4">
           <button
             onClick={handleStressTest}
-            disabled={!selectedFile || isStressTesting}
+            disabled={!selectedCoverFile || !selectedSecretFile || isStressTesting}
             className="flex items-center gap-2 px-6 py-3 bg-orange-500 text-white rounded hover:bg-orange-600 disabled:bg-gray-300 disabled:cursor-not-allowed"
           >
             <Play size={20} />

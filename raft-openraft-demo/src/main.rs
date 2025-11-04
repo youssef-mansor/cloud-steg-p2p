@@ -225,6 +225,9 @@ async fn main() -> Result<()> {
         self_http_addr: normalized_self_http,
         healthy_nodes: Arc::new(tokio::sync::RwLock::new(healthy_nodes)),
         degraded_ok: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        node_throughput_1: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        node_throughput_2: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        node_throughput_3: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     api::start_monitors(app_state.clone());

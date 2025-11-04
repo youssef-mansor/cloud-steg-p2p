@@ -1,10 +1,12 @@
 import type { ApiResponse, NodeMetrics } from '../types';
 
 // Default server addresses - can be configured
+// Local testing: http://127.0.0.1:8001/2/3
+// Distributed: http://10.40.49.211:8001, http://10.40.41.162:8002, http://10.40.46.168:8003
 const DEFAULT_NODES = [
-  { id: 1, httpAddr: 'http://10.40.49.211:8001' },
-  { id: 2, httpAddr: 'http://10.40.41.162:8002' },
-  { id: 3, httpAddr: 'http://10.40.46.168:8003' },
+  { id: 1, httpAddr: 'http://127.0.0.1:8001' },
+  { id: 2, httpAddr: 'http://127.0.0.1:8002' },
+  { id: 3, httpAddr: 'http://127.0.0.1:8003' },
 ];
 
 export class RaftApiClient {
@@ -37,6 +39,38 @@ export class RaftApiClient {
       });
 
       clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        return { success: false, error: `HTTP ${response.status}` };
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  }
+
+  // Get throughput metrics from a specific node (typically the leader, which tracks all nodes)
+  async getThroughput(nodeId: number): Promise<{ 
+    success: boolean; 
+    data?: { 
+      reporting_node_id: number; 
+      node_throughputs: Record<string, number>; 
+      timestamp: number 
+    }; 
+    error?: string 
+  }> {
+    const node = this.nodes.find((n) => n.id === nodeId);
+    if (!node) {
+      return { success: false, error: `Node ${nodeId} not found` };
+    }
+
+    try {
+      const response = await fetch(`${node.httpAddr}/metrics/throughput`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      });
 
       if (!response.ok) {
         return { success: false, error: `HTTP ${response.status}` };
@@ -83,11 +117,12 @@ export class RaftApiClient {
     return results;
   }
 
-  // Upload image to a specific node for encryption (steganography)
+  // Upload two images (cover + secret) for steganography encryption
   async uploadImageForEncryption(
     nodeId: number,
-    imageFile: File
-  ): Promise<{ success: boolean; data?: Blob; key?: string; error?: string; latency: number; processedBy?: number }> {
+    coverImage: File,
+    secretImage: File
+  ): Promise<{ success: boolean; data?: Blob; error?: string; latency: number; processedBy?: number }> {
     const node = this.nodes.find((n) => n.id === nodeId);
     if (!node) {
       return { success: false, error: `Node ${nodeId} not found`, latency: 0 };
@@ -96,16 +131,21 @@ export class RaftApiClient {
     const startTime = performance.now();
 
     try {
-      const arrayBuffer = await imageFile.arrayBuffer();
-      console.log(`Uploading to node ${nodeId} (${node.httpAddr}/image/steg), file size: ${arrayBuffer.byteLength} bytes`);
+      // Create multipart form data with both images
+      const formData = new FormData();
+      formData.append('cover', coverImage);
+      formData.append('secret', secretImage);
+      
+      console.log(`Uploading to node ${nodeId} (${node.httpAddr}/image/steg)`);
+      console.log(`  - Cover image: ${coverImage.name} (${coverImage.size} bytes)`);
+      console.log(`  - Secret image: ${secretImage.name} (${secretImage.size} bytes)`);
       
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout for image upload
       
       const response = await fetch(`${node.httpAddr}/image/steg`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: arrayBuffer,
+        body: formData,
         signal: controller.signal,
       });
 
@@ -113,35 +153,21 @@ export class RaftApiClient {
       const latency = performance.now() - startTime;
 
       if (!response.ok) {
-        console.error(`Node ${nodeId} returned HTTP ${response.status}`);
-        return { success: false, error: `HTTP ${response.status}`, latency };
+        const errorText = await response.text();
+        console.error(`Node ${nodeId} returned HTTP ${response.status}: ${errorText}`);
+        return { success: false, error: `HTTP ${response.status}: ${errorText}`, latency };
       }
 
-      // Parse JSON response with key and base64 image
-      const jsonResponse = await response.json();
-      const { key, image } = jsonResponse;
-
-      if (!key || !image) {
-        console.error(`Node ${nodeId} returned invalid response: missing key or image`);
-        return { success: false, error: 'Invalid response format', latency };
-      }
-
-      // Convert base64 image to Blob
-      const base64String = image.split(',')[1] || image; // Handle data:image/png;base64,... format
-      const byteCharacters = atob(base64String);
-      const byteNumbers = new Array(byteCharacters.length);
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-      }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: 'image/png' });
+      // Response is the stego image (PNG binary)
+      const arrayBuffer = await response.arrayBuffer();
+      const blob = new Blob([arrayBuffer], { type: 'image/png' });
 
       // Read X-Processed-By-Node header to track which node actually processed the request
       const processedByHeader = response.headers.get('X-Processed-By-Node');
       const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : nodeId;
 
-      console.log(`Node ${nodeId} succeeded: processed by node ${processedBy}, encryption key: ${key}, received ${blob.size} bytes, latency: ${latency.toFixed(0)}ms`);
-      return { success: true, data: blob, key, latency, processedBy };
+      console.log(`Node ${nodeId} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${latency.toFixed(0)}ms`);
+      return { success: true, data: blob, latency, processedBy };
     } catch (error) {
       const latency = performance.now() - startTime;
       console.error(`Node ${nodeId} error:`, error);
@@ -179,11 +205,10 @@ export class RaftApiClient {
     return null;
   }
 
-  // Send image to any available node (load balanced)
-  async uploadImageToCluster(imageFile: File): Promise<{
+  // Send two images to any available node (load balanced)
+  async uploadImageToCluster(coverImage: File, secretImage: File): Promise<{
     success: boolean;
     data?: Blob;
-    key?: string;
     error?: string;
     nodeId?: number;
     processedBy?: number;
@@ -194,7 +219,7 @@ export class RaftApiClient {
 
     if (leaderId) {
       console.log(`📤 Sending encryption request to leader Node ${leaderId}`);
-      const result = await this.uploadImageForEncryption(leaderId, imageFile);
+      const result = await this.uploadImageForEncryption(leaderId, coverImage, secretImage);
       if (result.success) {
         return { ...result, nodeId: leaderId };
       }
@@ -205,7 +230,7 @@ export class RaftApiClient {
     console.log('⚠️  Trying all nodes as fallback...');
     for (const node of this.nodes) {
       if (node.id === leaderId) continue; // Skip leader if we already tried it
-      const result = await this.uploadImageForEncryption(node.id, imageFile);
+      const result = await this.uploadImageForEncryption(node.id, coverImage, secretImage);
       if (result.success) {
         return { ...result, nodeId: node.id };
       }
@@ -218,8 +243,8 @@ export class RaftApiClient {
     };
   }
 
-  // Decrypt/Extract image from stego image - send to leader for load balancing
-  async decryptImageFromCluster(stegoFile: File, encryptionKey: string): Promise<{
+  // Extract/Decrypt image from stego image - send to leader for load balancing (no key needed)
+  async decryptImageFromCluster(stegoFile: File): Promise<{
     success: boolean;
     data?: Blob;
     error?: string;
@@ -236,7 +261,7 @@ export class RaftApiClient {
       const leaderId = await this.findLeader();
 
       if (leaderId) {
-        console.log(`📤 Sending decryption request to leader Node ${leaderId}`);
+        console.log(`📤 Sending extraction request to leader Node ${leaderId}`);
         const leaderNode = this.nodes.find((n) => n.id === leaderId);
         if (leaderNode) {
           const nodeStartTime = performance.now();
@@ -245,7 +270,7 @@ export class RaftApiClient {
           
           try {
             const response = await fetch(
-              `${leaderNode.httpAddr}/image/decrypt?key=${encodeURIComponent(encryptionKey)}`,
+              `${leaderNode.httpAddr}/image/extract`,
               {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/octet-stream' },
@@ -286,7 +311,7 @@ export class RaftApiClient {
       
       const results = await Promise.allSettled(
         this.nodes.map(async (node) => {
-          console.log(`Attempting decryption on node ${node.id} (${node.httpAddr}/image/decrypt?key=${encryptionKey}), file size: ${arrayBuffer.byteLength} bytes`);
+          console.log(`Attempting extraction on node ${node.id} (${node.httpAddr}/image/extract), file size: ${arrayBuffer.byteLength} bytes`);
           
           const nodeStartTime = performance.now();
           const nodeController = new AbortController();
@@ -294,7 +319,7 @@ export class RaftApiClient {
           
           try {
             const response = await fetch(
-              `${node.httpAddr}/image/decrypt?key=${encodeURIComponent(encryptionKey)}`,
+              `${node.httpAddr}/image/extract`,
               {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/octet-stream' },
@@ -307,8 +332,9 @@ export class RaftApiClient {
             const nodeLatency = performance.now() - nodeStartTime;
 
             if (!response.ok) {
-              console.error(`Node ${node.id} returned HTTP ${response.status}`);
-              throw new Error(`HTTP ${response.status}`);
+              const errorText = await response.text();
+              console.error(`Node ${node.id} returned HTTP ${response.status}: ${errorText}`);
+              throw new Error(`HTTP ${response.status}: ${errorText}`);
             }
 
             const processedByHeader = response.headers.get('X-Processed-By-Node');
@@ -379,7 +405,7 @@ export class RaftApiClient {
       };
     } catch (error) {
       const latency = performance.now() - startTime;
-      console.error('Decryption error:', error);
+      console.error('Extraction error:', error);
       const errorMsg = error instanceof Error ? error.message : String(error);
       let friendlyError = errorMsg;
       

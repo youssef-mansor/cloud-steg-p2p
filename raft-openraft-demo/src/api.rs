@@ -7,20 +7,20 @@ use axum::{
     Json, Router,
 };
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::cors::{CorsLayer, Any};
 use openraft::{Raft, ServerState};
 use openraft_memstore::TypeConfig;
 use rand::random;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration, Instant};
 use png as png_crate;
 
 pub type NodeId = u64;
 pub type RaftNode = Raft<TypeConfig>;
-
 
 /// Application state shared across HTTP handlers
 #[derive(Clone)]
@@ -31,6 +31,9 @@ pub struct AppState {
     pub self_http_addr: String,
     pub healthy_nodes: Arc<RwLock<BTreeMap<NodeId, bool>>>, // Track which nodes are healthy
     pub degraded_ok: Arc<AtomicBool>, // Allow degraded mode (stateless requests) when true
+    pub node_throughput_1: Arc<AtomicU64>, // Atomic counter for node 1 requests
+    pub node_throughput_2: Arc<AtomicU64>, // Atomic counter for node 2 requests
+    pub node_throughput_3: Arc<AtomicU64>, // Atomic counter for node 3 requests
 }
 
 
@@ -234,15 +237,24 @@ pub struct ApiResponse<T> {
 
 /// Create the HTTP router
 pub fn create_router(app_state: AppState) -> Router {
+    // Configure CORS to allow cross-origin requests from web UI
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers(Any);  // CRITICAL: Expose custom headers like X-Processed-By-Node to browser
+    
     Router::new()
         .route("/", get(root))
         .route("/metrics", get(metrics))
+        .route("/metrics/throughput", get(metrics_throughput))
         .route("/cluster/init", post(init_cluster))
         .route("/cluster/add-learner", post(add_learner))
         .route("/cluster/change-membership", post(change_membership))
         .route("/image/echo", post(echo_image))      // Echo: return same image
         .route("/image/steg", post(steg_image_multipart))      // Steganography: embed and return stego image (multipart)
         .route("/image/extract", post(extract_image))          // Extract secret from stego image
+        .layer(cors)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // axum extractor limit
         .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // hyper/tower hard cap
         .with_state(app_state)
@@ -281,6 +293,33 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             })
         }
     }
+}
+
+/// Get throughput metrics for all nodes (as tracked by this node, typically the leader)
+async fn metrics_throughput(State(state): State<AppState>) -> impl IntoResponse {
+    // Read atomic counters (very fast, no lock needed)
+    let count_1 = state.node_throughput_1.load(Ordering::Relaxed);
+    let count_2 = state.node_throughput_2.load(Ordering::Relaxed);
+    let count_3 = state.node_throughput_3.load(Ordering::Relaxed);
+    
+    // Collect throughput for all nodes
+    let mut node_throughputs = serde_json::Map::new();
+    node_throughputs.insert("node_1".to_string(), serde_json::json!(count_1));
+    node_throughputs.insert("node_2".to_string(), serde_json::json!(count_2));
+    node_throughputs.insert("node_3".to_string(), serde_json::json!(count_3));
+    
+    Json(ApiResponse {
+        success: true,
+        data: Some(serde_json::json!({
+            "reporting_node_id": state.node_id,
+            "node_throughputs": node_throughputs,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+        })),
+        error: None,
+    })
 }
 
 /// Initialize cluster
@@ -490,8 +529,17 @@ async fn echo_image(
     
     if target_id == state.node_id {
         // Process locally
-        println!("📥 Node {} (leader) processing echo request locally: {} bytes", state.node_id, image_size);
+        println!("✅ Node {} (leader) processing echo request locally: {} bytes", state.node_id, image_size);
         println!("📤 Echoing back {} bytes", image_size);
+        
+        // Track throughput (atomic, no lock needed)
+        match state.node_id {
+            1 => state.node_throughput_1.fetch_add(1, Ordering::Relaxed),
+            2 => state.node_throughput_2.fetch_add(1, Ordering::Relaxed),
+            3 => state.node_throughput_3.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+        
         (
             StatusCode::OK,
             [
@@ -513,6 +561,14 @@ async fn echo_image(
                         let mut healthy = state.healthy_nodes.write().await;
                         healthy.insert(target_id, true);
                         drop(healthy);
+                        
+                        // Track throughput for the node that processed it (atomic, no lock needed)
+                        match target_id {
+                            1 => state.node_throughput_1.fetch_add(1, Ordering::Relaxed),
+                            2 => state.node_throughput_2.fetch_add(1, Ordering::Relaxed),
+                            3 => state.node_throughput_3.fetch_add(1, Ordering::Relaxed),
+                            _ => 0,
+                        };
                         
                         let mut headers = HeaderMap::new();
                         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
@@ -544,6 +600,15 @@ async fn echo_image(
                 
                 // Fallback: process locally instead of failing
                 println!("🔄 Node {} (leader) falling back to local echo processing after forward failure", state.node_id);
+                
+                // Track throughput (atomic, no lock needed)
+                match state.node_id {
+                    1 => state.node_throughput_1.fetch_add(1, Ordering::Relaxed),
+                    2 => state.node_throughput_2.fetch_add(1, Ordering::Relaxed),
+                    3 => state.node_throughput_3.fetch_add(1, Ordering::Relaxed),
+                    _ => 0,
+                };
+                
                 return (
                     StatusCode::OK,
                     [
@@ -708,6 +773,15 @@ async fn steg_image_multipart(
         let node_id = state.node_id;
         let sm = secret_mime.clone();
         let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
+        
+        // Track throughput (atomic, no lock needed)
+        match node_id {
+            1 => state.node_throughput_1.fetch_add(1, Ordering::Relaxed),
+            2 => state.node_throughput_2.fetch_add(1, Ordering::Relaxed),
+            3 => state.node_throughput_3.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+        
         return match res {
             Ok(Ok(stego_bytes)) => (
                     StatusCode::OK,
@@ -760,6 +834,17 @@ async fn steg_image_multipart(
                         let mut healthy = state.healthy_nodes.write().await;
                         healthy.insert(target_id, true);
                         drop(healthy);
+                    
+                    // Track throughput for the node that processed it (atomic, no lock needed)
+                    if let Ok(proc_node_id) = processed_by.parse::<NodeId>() {
+                        match proc_node_id {
+                            1 => state.node_throughput_1.fetch_add(1, Ordering::Relaxed),
+                            2 => state.node_throughput_2.fetch_add(1, Ordering::Relaxed),
+                            3 => state.node_throughput_3.fetch_add(1, Ordering::Relaxed),
+                            _ => 0,
+                        };
+                    }
+                    
                     let mut h = HeaderMap::new();
                     h.insert("Content-Type", "image/png".parse().unwrap());
                     h.insert("X-Processed-By-Node", processed_by.parse().unwrap());

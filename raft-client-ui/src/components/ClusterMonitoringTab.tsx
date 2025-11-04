@@ -2,62 +2,105 @@ import { useState, useEffect } from 'react';
 import { Activity, Server, Crown, AlertCircle, RefreshCw } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { useClusterMetrics } from '../hooks/useClusterMetrics';
+import { apiClient } from '../api/client';
 import type { TimeSeriesDataPoint } from '../types';
 
 export function ClusterMonitoringTab() {
   const { nodeStatuses, lastUpdate, isPolling, setIsPolling, refresh } = useClusterMetrics(2000);
   const [timeSeriesData, setTimeSeriesData] = useState<TimeSeriesDataPoint[]>([]);
-  
-  // Track request rates per node - can be updated from stress test
-  const [nodeRequestRates, setNodeRequestRates] = useState<{ node1: number; node2: number; node3: number }>({
-    node1: 0,
-    node2: 0,
-    node3: 0,
-  });
+  const [lastRequestCounts, setLastRequestCounts] = useState<{ node1: number; node2: number; node3: number }>({ node1: 0, node2: 0, node3: 0 });
+  const [lastTimestamp, setLastTimestamp] = useState<number>(Date.now());
+  const [isInitialized, setIsInitialized] = useState<boolean>(false);
 
-  // Expose method for updating rates from stress test (cast as unknown to avoid TypeScript any error)
-  const updateRates = (rates: { node1: number; node2: number; node3: number }) => {
-    setNodeRequestRates(rates);
-  };
-  
-  // Make available globally for stress test component
+  // Fetch throughput data from the leader node every second (independent of metrics polling)
   useEffect(() => {
-    (globalThis as Record<string, unknown>).updateClusterRequestRates = updateRates;
-  }, []);
+    if (!isPolling) return;
 
-  // Update time series data when request rates change
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const now = Date.now();
-      
-      // Create new data point with current request rates
-      const dataPoint: TimeSeriesDataPoint = {
-        timestamp: now,
-        node1: nodeRequestRates.node1,
-        node2: nodeRequestRates.node2,
-        node3: nodeRequestRates.node3,
-      };
-      
-      setTimeSeriesData((prev) => {
-        const newData = [...prev];
-        newData.push(dataPoint);
+    // Find the current leader
+    const currentLeader = nodeStatuses.find((n) => n.isLeader);
+    if (!currentLeader) return; // Wait until leader is elected
+    
+    const leaderNodeId = currentLeader.nodeId;
+    
+    const fetchThroughput = async () => {
+      try {
+        // Fetch throughput data from the leader (it tracks all nodes)
+        const response = await apiClient.getThroughput(leaderNodeId);
         
-        // Keep only last 30 data points (1 minute of data at 2s intervals)
-        return newData.slice(-30);
-      });
-    }, 2000);
+        if (response.success && response.data) {
+          const now = Date.now();
+          const nodeThroughputs = response.data.node_throughputs || {};
+
+          // Get current cumulative counts
+          const currentCounts = {
+            node1: nodeThroughputs.node_1 || 0,
+            node2: nodeThroughputs.node_2 || 0,
+            node3: nodeThroughputs.node_3 || 0,
+          };
+
+          // On first initialization, just record the baseline - don't calculate throughput yet
+          if (!isInitialized) {
+            setLastRequestCounts(currentCounts);
+            setLastTimestamp(now);
+            setIsInitialized(true);
+            return;
+          }
+
+          // Calculate req/sec based on count difference and time elapsed
+          const timeElapsed = (now - lastTimestamp) / 1000; // seconds
+          
+          // Only add data point if at least 1 second has elapsed
+          if (timeElapsed >= 0.9) { // Allow small margin for timing variations
+            const reqPerSec = {
+              node1: timeElapsed > 0 ? (currentCounts.node1 - lastRequestCounts.node1) / timeElapsed : 0,
+              node2: timeElapsed > 0 ? (currentCounts.node2 - lastRequestCounts.node2) / timeElapsed : 0,
+              node3: timeElapsed > 0 ? (currentCounts.node3 - lastRequestCounts.node3) / timeElapsed : 0,
+            };
+
+            // Update state
+            setLastRequestCounts(currentCounts);
+            setLastTimestamp(now);
+
+            // Add data point with calculated req/sec
+            const dataPoint: TimeSeriesDataPoint = {
+              timestamp: now,
+              node1: Math.max(0, reqPerSec.node1), // Ensure non-negative
+              node2: Math.max(0, reqPerSec.node2),
+              node3: Math.max(0, reqPerSec.node3),
+            };
+
+            setTimeSeriesData((prev) => {
+              const newData = [...prev];
+              newData.push(dataPoint);
+
+              // Keep only last 60 data points (1 minute of data at 1s intervals)
+              return newData.slice(-60);
+            });
+          }
+        }
+      } catch (error) {
+        // Silently handle errors during throughput fetch
+      }
+    };
+
+    // Fetch once immediately when polling starts or leader changes
+    fetchThroughput();
+    
+    // Set up the interval - runs every second
+    const interval = setInterval(fetchThroughput, 1000);
 
     return () => clearInterval(interval);
-  }, [nodeRequestRates]);
+  }, [isPolling, nodeStatuses.find((n) => n.isLeader)?.nodeId, lastRequestCounts, lastTimestamp, isInitialized]);
 
-  // Format timestamp for graph
+  // Format timestamp for graph - memoized to avoid recreation on every render
   const formatTime = (timestamp: number) => {
     const date = new Date(timestamp);
     return date.toLocaleTimeString('en-US', { hour12: false, minute: '2-digit', second: '2-digit' });
   };
 
+  // Find leader - but don't re-run the entire component when this changes
   const leader = nodeStatuses.find((n) => n.isLeader);
-  const currentTerm = leader?.term || Math.max(...nodeStatuses.map((n) => n.term), 0);
+  const currentTerm = leader?.term || (nodeStatuses.length > 0 ? Math.max(...nodeStatuses.map((n) => n.term), 0) : 0);
 
   return (
     <div className="space-y-6">
@@ -166,6 +209,16 @@ export function ClusterMonitoringTab() {
       <div className="bg-white rounded-lg shadow p-6">
         <h2 className="text-2xl font-bold mb-4">Requests Per Second (Real-time)</h2>
         
+        {/* Debug info */}
+        {timeSeriesData.length > 0 && (
+          <div className="mb-2 text-xs text-gray-500 font-mono">
+            Data points: {timeSeriesData.length} | 
+            Last values: N1={timeSeriesData[timeSeriesData.length - 1]?.node1.toFixed(1)}, 
+            N2={timeSeriesData[timeSeriesData.length - 1]?.node2.toFixed(1)}, 
+            N3={timeSeriesData[timeSeriesData.length - 1]?.node3.toFixed(1)}
+          </div>
+        )}
+        
         {timeSeriesData.length > 0 ? (
           <ResponsiveContainer width="100%" height={400}>
             <LineChart data={timeSeriesData}>
@@ -174,9 +227,25 @@ export function ClusterMonitoringTab() {
                 dataKey="timestamp"
                 tickFormatter={formatTime}
                 label={{ value: 'Time', position: 'insideBottom', offset: -5 }}
+                interval="preserveStartEnd"
+                minTickGap={50}
               />
-              <YAxis label={{ value: 'Requests/sec', angle: -90, position: 'insideLeft' }} />
-              <Tooltip labelFormatter={formatTime} />
+              <YAxis 
+                label={{ value: 'Requests/sec', angle: -90, position: 'insideLeft' }}
+                domain={[0, 'auto']}
+                allowDecimals={true}
+              />
+              <Tooltip 
+                labelFormatter={formatTime}
+                formatter={(value: number, name: string) => {
+                  const nodeNames: { [key: string]: string } = {
+                    'node1': 'Node 1',
+                    'node2': 'Node 2',
+                    'node3': 'Node 3',
+                  };
+                  return [value.toFixed(1), nodeNames[name as keyof typeof nodeNames] || name];
+                }}
+              />
               <Legend />
               <Line
                 type="monotone"
@@ -185,6 +254,8 @@ export function ClusterMonitoringTab() {
                 name="Node 1"
                 strokeWidth={2}
                 dot={false}
+                isAnimationActive={false}
+                connectNulls={true}
               />
               <Line
                 type="monotone"
@@ -193,6 +264,8 @@ export function ClusterMonitoringTab() {
                 name="Node 2"
                 strokeWidth={2}
                 dot={false}
+                isAnimationActive={false}
+                connectNulls={true}
               />
               <Line
                 type="monotone"
@@ -201,6 +274,8 @@ export function ClusterMonitoringTab() {
                 name="Node 3"
                 strokeWidth={2}
                 dot={false}
+                isAnimationActive={false}
+                connectNulls={true}
               />
             </LineChart>
           </ResponsiveContainer>
