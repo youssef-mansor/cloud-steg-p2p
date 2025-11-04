@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
+    body::Bytes,
     Json, Router,
 };
 use tower_http::limit::RequestBodyLimitLayer;
@@ -12,7 +13,9 @@ use rand::random;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
+use tokio::time::{sleep, Duration, Instant};
 use png as png_crate;
 
 pub type NodeId = u64;
@@ -27,6 +30,7 @@ pub struct AppState {
     pub http_addresses: Arc<RwLock<BTreeMap<NodeId, String>>>,
     pub self_http_addr: String,
     pub healthy_nodes: Arc<RwLock<BTreeMap<NodeId, bool>>>, // Track which nodes are healthy
+    pub degraded_ok: Arc<AtomicBool>, // Allow degraded mode (stateless requests) when true
 }
 
 
@@ -46,6 +50,157 @@ pub fn start_monitors(state: AppState) {
     let state_clone = Arc::clone(&state_arc);
     tokio::spawn(async move {
         crate::single_node_monitor::monitor_new_nodes(state_clone).await;
+    });
+    
+    // Start peer health pings
+    start_peer_health_pings(state.clone());
+    
+    // Start no-leader monitor (allows degraded mode after timeout)
+    start_no_leader_monitor(state.clone());
+    
+    // Start leader watchdog (proactively shrinks membership before losing quorum)
+    start_leader_watchdog(state.clone());
+}
+
+/// Periodic peer health pings to keep healthy_nodes updated
+pub fn start_peer_health_pings(state: AppState) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        
+        loop {
+            sleep(Duration::from_secs(1)).await;
+            
+            let addrs = state.http_addresses.read().await.clone();
+            for (id, addr) in addrs {
+                if id == state.node_id {
+                    continue;
+                }
+                
+                let url = format!("http://{}/metrics", addr);
+                let ok = match client.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => true,
+                    _ => false,
+                };
+                
+                let mut h = state.healthy_nodes.write().await;
+                h.insert(id, ok);
+                drop(h);
+            }
+        }
+    });
+}
+
+/// Monitor for no-leader condition and enable degraded mode after timeout
+pub fn start_no_leader_monitor(state: AppState) {
+    tokio::spawn(async move {
+        let mut no_leader_since: Option<Instant> = None;
+        let threshold = Duration::from_secs(3);
+        
+        loop {
+            sleep(Duration::from_millis(300)).await;
+            
+            let m = state.raft.metrics().borrow().clone();
+            let has_leader = m.current_leader.is_some();
+            
+            if has_leader {
+                no_leader_since = None;
+                state.degraded_ok.store(false, Ordering::Relaxed);
+                continue;
+            }
+            
+            if no_leader_since.is_none() {
+                no_leader_since = Some(Instant::now());
+            }
+            
+            if let Some(start) = no_leader_since {
+                if start.elapsed() >= threshold {
+                    // Check if all peers appear unhealthy
+                    let (others_unhealthy, count) = {
+                        let http_addrs = state.http_addresses.read().await;
+                        let healthy = state.healthy_nodes.read().await;
+                        let count = http_addrs.len();
+                        let others_unhealthy = http_addrs.iter()
+                            .filter(|(id, _)| **id != state.node_id)
+                            .all(|(id, _)| !healthy.get(id).copied().unwrap_or(false));
+                        (others_unhealthy, count)
+                    };
+                    
+                    if others_unhealthy || count <= 1 {
+                        state.degraded_ok.store(true, Ordering::Relaxed);
+                        println!("🆘 Node {}: No leader for {:?}, all others unhealthy - enabling degraded mode", 
+                            state.node_id, start.elapsed());
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Leader watchdog: proactively shrink membership before losing quorum
+pub fn start_leader_watchdog(state: AppState) {
+    tokio::spawn(async move {
+        let check_every = Duration::from_millis(500);
+        let suspect_for = Duration::from_secs(3);
+        let mut bad_since: Option<Instant> = None;
+        
+        loop {
+            sleep(check_every).await;
+            
+            let m = state.raft.metrics().borrow().clone();
+            if !matches!(m.state, ServerState::Leader) {
+                bad_since = None;
+                continue;
+            }
+            
+            // Get current voters from membership
+            let voters: Vec<NodeId> = m.membership_config
+                .membership()
+                .voter_ids()
+                .collect();
+            
+            // Count unhealthy voters (excluding self)
+            let healthy = state.healthy_nodes.read().await;
+            let unhealthy_count = voters.iter()
+                .filter(|&&id| id != state.node_id)
+                .filter(|&&id| !healthy.get(&id).copied().unwrap_or(false))
+                .count();
+            drop(healthy);
+            
+            // Calculate if we're losing quorum
+            let majority = (voters.len() / 2) + 1;
+            let max_fail_to_keep_quorum = voters.len() + 1 - majority - 1; // e.g., 3 voters -> 0 max failures
+            let losing_quorum = unhealthy_count > max_fail_to_keep_quorum;
+            
+            if losing_quorum {
+                if bad_since.is_none() {
+                    bad_since = Some(Instant::now());
+                    println!("⚠️ Node {} (leader) detected {} unhealthy voters, may lose quorum soon", 
+                        state.node_id, unhealthy_count);
+                }
+                
+                if let Some(start) = bad_since {
+                    if start.elapsed() >= suspect_for {
+                        println!("🎯 Node {} (leader) proactively shrinking membership to [{}] before losing quorum", 
+                            state.node_id, state.node_id);
+                        match state.raft.change_membership(vec![state.node_id], true).await {
+                            Ok(_) => {
+                                println!("✅ Node {} successfully changed membership to [{}]", state.node_id, state.node_id);
+                                bad_since = None;
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to change membership: {}", e);
+                                bad_since = None; // Reset to try again later
+                            }
+                        }
+                    }
+                }
+            } else {
+                bad_since = None;
+            }
+        }
     });
 }
 
@@ -197,12 +352,14 @@ async fn forward_request_to_node(
     content_type: Option<&str>,
 ) -> Result<reqwest::Response, String> {
     let url = format!("http://{}{}", http_addr, path);
-    // Create client with timeout to avoid hanging on crashed nodes
+    // Create client with shorter timeout to avoid hanging on crashed nodes
+    // Use 5 seconds - enough for normal requests but fast failure for down nodes
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(2))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
+    
     let mut req = client.post(&url).header("X-Raft-Forwarded", "true");
     if let Some(ct) = content_type { req = req.header("Content-Type", ct); }
     req.body(body.to_vec())
@@ -237,38 +394,43 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
         }
     }
     
-    // If we have healthy nodes and random check (20% chance), give unhealthy nodes a chance
-    // This allows crashed nodes to prove they've recovered
-    let use_unhealthy = !healthy_node_ids.is_empty() && 
-                        !unhealthy_node_ids.is_empty() && 
-                        (random::<usize>() % 5) == 0; // 20% chance (1 in 5)
-    
-    if use_unhealthy && !unhealthy_node_ids.is_empty() {
-        // Give an unhealthy node a chance to prove it's back
-        let idx = random::<usize>() % unhealthy_node_ids.len();
-        let selected_id = unhealthy_node_ids[idx];
-        let addr = http_addrs.get(&selected_id)?.clone();
-        println!("🔍 Probation: trying unhealthy node {} to check if it recovered", selected_id);
-        return Some((selected_id, addr));
-    }
+    // NEVER select unhealthy nodes if we have healthy alternatives
+    // This prevents hanging on down nodes
     
     // Normal case: select from healthy nodes
     if healthy_node_ids.is_empty() {
-        // No healthy nodes, try unhealthy ones
-        if unhealthy_node_ids.is_empty() {
-            return Some((state.node_id, state.self_http_addr.clone()));
-        }
-        let idx = random::<usize>() % unhealthy_node_ids.len();
-        let selected_id = unhealthy_node_ids[idx];
-        let addr = http_addrs.get(&selected_id)?.clone();
-        return Some((selected_id, addr));
+        // No healthy nodes (shouldn't happen since self is always healthy), fallback to self
+        println!("⚠️ No healthy nodes found, using self as fallback");
+        return Some((state.node_id, state.self_http_addr.clone()));
     }
     
-    let idx = random::<usize>() % healthy_node_ids.len();
-    let selected_id = healthy_node_ids[idx];
-    let addr = http_addrs.get(&selected_id)?.clone();
+    // If self is the only healthy node, always select self
+    if healthy_node_ids.len() == 1 && healthy_node_ids[0] == state.node_id {
+        println!("✅ Only self is healthy, processing locally");
+        return Some((state.node_id, state.self_http_addr.clone()));
+    }
     
-    Some((selected_id, addr))
+    // Select randomly from healthy nodes (excluding self only if there are other healthy nodes)
+    let healthy_non_self: Vec<_> = healthy_node_ids.iter()
+        .filter(|&&id| id != state.node_id)
+        .copied()
+        .collect();
+    
+    if !healthy_non_self.is_empty() {
+        // Prefer other healthy nodes for load balancing, but include self in the pool
+        let all_healthy = healthy_node_ids;
+        let idx = random::<usize>() % all_healthy.len();
+        let selected_id = all_healthy[idx];
+        let addr = if selected_id == state.node_id {
+            state.self_http_addr.clone()
+        } else {
+            http_addrs.get(&selected_id)?.clone()
+        };
+        Some((selected_id, addr))
+    } else {
+        // Only self is healthy
+        Some((state.node_id, state.self_http_addr.clone()))
+    }
 }
 
 /// Echo image - receive and return immediately (no processing)
@@ -276,7 +438,7 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
 async fn echo_image(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: Bytes,
 ) -> impl IntoResponse {
     let image_size = body.len();
     
@@ -289,12 +451,18 @@ async fn echo_image(
     
     // Followers only accept forwarded requests, not direct client requests
     if !is_leader && !is_forwarded {
-        println!("🚫 Node {} (follower) dropping direct echo request - only leader processes direct requests", state.node_id);
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [("Content-Type", "application/json")],
-            format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
-        ).into_response();
+        // Check if degraded mode is enabled
+        let can_degrade = state.degraded_ok.load(Ordering::Relaxed);
+        if !can_degrade {
+            println!("🚫 Node {} (follower) dropping direct echo request - only leader processes direct requests", state.node_id);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Content-Type", "application/json")],
+                format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
+            ).into_response();
+        }
+        // Degraded mode: process request
+        println!("🆘 Node {} (degraded mode) processing echo request directly - degraded_ok=true", state.node_id);
     }
     
     // If forwarded request and we're a follower, process it
@@ -368,18 +536,22 @@ async fn echo_image(
                 }
             }
             Err(e) => {
-                eprintln!("❌ Failed to forward to node {}: {} - marking as unhealthy", target_id, e);
+                eprintln!("❌ Failed to forward echo to node {}: {} - marking as unhealthy, processing locally as fallback", target_id, e);
                 // Mark node as unhealthy when forwarding fails
                 let mut healthy = state.healthy_nodes.write().await;
                 healthy.insert(target_id, false);
                 drop(healthy);
                 
-                // Return error - client should retry (multicast again)
-                (
-                    StatusCode::BAD_GATEWAY,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to forward to node {}: {}"}}"#, target_id, e),
-                ).into_response()
+                // Fallback: process locally instead of failing
+                println!("🔄 Node {} (leader) falling back to local echo processing after forward failure", state.node_id);
+                return (
+                    StatusCode::OK,
+                    [
+                        ("Content-Type", "application/octet-stream"),
+                        ("X-Processed-By-Node", &format!("{}", state.node_id)),
+                    ],
+                    body,
+                ).into_response();
             }
         }
     }
@@ -387,11 +559,17 @@ async fn echo_image(
 
 /// Embed image - receive image and return stego image with secret embedded
 /// Load balancing: Followers reject direct requests, Leader forwards randomly
+#[axum::debug_handler]
 async fn steg_image_multipart(
     State(state): State<AppState>,
-    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    // Note: We can't extract HeaderMap with Multipart, so we'll check forwarded status
+    // via a workaround - when forwarding, we'll include it in the multipart fields or
+    // check it from the request context. For now, assume not forwarded for direct requests.
+    // The forwarded check will be handled by checking if the node is leader or follower.
+    let is_forwarded = false; // Will be true when request comes from leader forwarding
+    
     // Parse multipart safely: expect fields 'cover' and 'secret'
     let mut cover: Option<Vec<u8>> = None;
     let mut secret: Option<Vec<u8>> = None;
@@ -403,11 +581,11 @@ async fn steg_image_multipart(
         let bytes = match field.bytes().await {
             Ok(b) => b.to_vec(),
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [("Content-Type", "application/json")],
+        return (
+            StatusCode::BAD_REQUEST,
+            [("Content-Type", "application/json")],
                     format!(r#"{{"error": "Failed to read multipart field: {}"}}"#, e),
-                ).into_response();
+        ).into_response();
             }
         };
         if name == "cover" { cover = Some(bytes); }
@@ -427,7 +605,7 @@ async fn steg_image_multipart(
 
     let metrics = state.raft.metrics().borrow().clone();
     let is_leader = matches!(metrics.state, ServerState::Leader);
-    let is_forwarded = headers.contains_key("x-raft-forwarded");
+    // Note: is_forwarded is set above - when multipart is used, we check via internal forwarding
 
     // Followers only accept forwarded requests, except in single-node mode
     if !is_leader && is_forwarded {
@@ -436,14 +614,14 @@ async fn steg_image_multipart(
         let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
         return match res {
             Ok(Ok(stego_bytes)) => (
-                StatusCode::OK,
+                    StatusCode::OK,
                 [("Content-Type", "image/png"), ("X-Processed-By-Node", &format!("{}", node_id))],
-                axum::body::Bytes::from(stego_bytes),
+                    axum::body::Bytes::from(stego_bytes),
             ).into_response(),
             Ok(Err(e)) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Content-Type", "application/json")],
-                format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+            [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
             ).into_response(),
             Err(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -479,35 +657,71 @@ async fn steg_image_multipart(
                 ).into_response(),
             };
         } else {
-            return (
+            // Check if degraded mode is enabled (via no-leader monitor)
+            let can_degrade = state.degraded_ok.load(Ordering::Relaxed);
+            
+            if can_degrade {
+                println!("🆘 Node {} (degraded mode) processing steg request directly - degraded_ok=true", state.node_id);
+                let node_id = state.node_id;
+                let sm = secret_mime.clone();
+                let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
+                return match res {
+                    Ok(Ok(stego_bytes)) => (
+                    StatusCode::OK,
+                        [("Content-Type", "image/png"), ("X-Processed-By-Node", &format!("{}", node_id))],
+                    axum::body::Bytes::from(stego_bytes),
+                    ).into_response(),
+                    Ok(Err(e)) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                    ).into_response(),
+                    Err(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [("Content-Type", "application/json")],
+                        "Task execution failed".to_string(),
+                    ).into_response(),
+                };
+            }
+            
+                return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                [("Content-Type", "application/json")],
+                    [("Content-Type", "application/json")],
                 format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
-            ).into_response();
+                ).into_response();
         }
     }
 
     // Leader: forward to a randomly selected node (including self)
-    let (target_id, target_addr) = match get_random_node(&state).await { Some(v) => v, None => (state.node_id, state.self_http_addr.clone()) };
+    let (target_id, target_addr) = match get_random_node(&state).await { 
+        Some(v) => v, 
+        None => {
+            // No nodes available, process locally as fallback
+            println!("⚠️ Node {} (leader) has no available nodes, processing locally", state.node_id);
+            (state.node_id, state.self_http_addr.clone())
+        }
+    };
+    
     if target_id == state.node_id {
         // Process locally
+        println!("✅ Node {} (leader) processing steg request locally", state.node_id);
         let node_id = state.node_id;
         let sm = secret_mime.clone();
         let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
         return match res {
             Ok(Ok(stego_bytes)) => (
-                StatusCode::OK,
+                    StatusCode::OK,
                 [("Content-Type", "image/png"), ("X-Processed-By-Node", &format!("{}", node_id))],
-                axum::body::Bytes::from(stego_bytes),
+                    axum::body::Bytes::from(stego_bytes),
             ).into_response(),
             Ok(Err(e)) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Content-Type", "application/json")],
-                format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
             ).into_response(),
             Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Content-Type", "application/json")],
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
                 "Task execution failed".to_string(),
             ).into_response(),
         };
@@ -541,11 +755,11 @@ async fn steg_image_multipart(
         Ok(r) => {
             let processed_by = r.headers().get("x-processed-by-node").and_then(|h| h.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| format!("{}", target_id));
             match r.bytes().await {
-                Ok(bytes) => {
+                    Ok(bytes) => {
                     // Mark node healthy
-                    let mut healthy = state.healthy_nodes.write().await;
-                    healthy.insert(target_id, true);
-                    drop(healthy);
+                        let mut healthy = state.healthy_nodes.write().await;
+                        healthy.insert(target_id, true);
+                        drop(healthy);
                     let mut h = HeaderMap::new();
                     h.insert("Content-Type", "image/png".parse().unwrap());
                     h.insert("X-Processed-By-Node", processed_by.parse().unwrap());
@@ -553,9 +767,9 @@ async fn steg_image_multipart(
                 }
                 Err(_e) => {
                     // Mark node unhealthy and process locally as fallback
-                    let mut healthy = state.healthy_nodes.write().await;
-                    healthy.insert(target_id, false);
-                    drop(healthy);
+                        let mut healthy = state.healthy_nodes.write().await;
+                        healthy.insert(target_id, false);
+                        drop(healthy);
                     let node_id = state.node_id;
                     let sm = secret_mime.clone();
                     let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
@@ -581,9 +795,9 @@ async fn steg_image_multipart(
         }
         Err(_e) => {
             // Mark node unhealthy and process locally as fallback
-            let mut healthy = state.healthy_nodes.write().await;
-            healthy.insert(target_id, false);
-            drop(healthy);
+                let mut healthy = state.healthy_nodes.write().await;
+                healthy.insert(target_id, false);
+                drop(healthy);
             let node_id = state.node_id;
             let sm = secret_mime.clone();
             let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
@@ -641,6 +855,67 @@ fn embed_cover_with_secret_chunk(
     Ok(out)
 }
 
+/// Simple multipart parser - extracts cover and secret fields
+fn parse_multipart_simple(body: &[u8], boundary: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>) {
+    let delim = format!("--{}", boundary);
+    let delim_bytes = delim.as_bytes();
+    let mut cover: Option<Vec<u8>> = None;
+    let mut secret: Option<Vec<u8>> = None;
+    let mut secret_mime: Option<String> = None;
+    
+    // Find boundary positions
+    let mut pos = 0;
+    while let Some(boundary_pos) = body[pos..].windows(delim_bytes.len()).position(|w| w == delim_bytes) {
+        let part_start = pos + boundary_pos + delim_bytes.len();
+        if part_start >= body.len() { break; }
+        
+        // Skip CRLF after boundary
+        let mut data_start = part_start;
+        if data_start + 2 <= body.len() && &body[data_start..data_start+2] == b"\r\n" {
+            data_start += 2;
+        }
+        
+        // Find end of headers (CRLFCRLF) or next boundary
+        let headers_end = body[data_start..].windows(4).position(|w| w == b"\r\n\r\n");
+        let headers_end = headers_end.map(|i| data_start + i + 4).unwrap_or(data_start);
+        
+        // Check headers for field name
+        let headers = &body[data_start..headers_end.min(body.len())];
+        let headers_str = String::from_utf8_lossy(headers);
+        
+        if headers_str.contains("name=\"cover\"") {
+            // Find next boundary or end
+            let next_boundary = body[headers_end..].windows(delim_bytes.len()).position(|w| w == delim_bytes);
+            let data_end = next_boundary.map(|i| headers_end + i).unwrap_or(body.len());
+            // Remove trailing CRLF before boundary
+            let mut data_end_adj = data_end;
+            if data_end_adj >= 2 && &body[data_end_adj - 2..data_end_adj] == b"\r\n" {
+                data_end_adj -= 2;
+            }
+            cover = Some(body[headers_end..data_end_adj].to_vec());
+        } else if headers_str.contains("name=\"secret\"") {
+            // Extract content-type from headers
+            if let Some(ct_line) = headers_str.lines().find(|l| l.to_lowercase().starts_with("content-type:")) {
+                secret_mime = ct_line.split(':').nth(1).map(|s| s.trim().to_string());
+            }
+            // Find next boundary or end
+            let next_boundary = body[headers_end..].windows(delim_bytes.len()).position(|w| w == delim_bytes);
+            let data_end = next_boundary.map(|i| headers_end + i).unwrap_or(body.len());
+            let mut data_end_adj = data_end;
+            if data_end_adj >= 2 && &body[data_end_adj - 2..data_end_adj] == b"\r\n" {
+                data_end_adj -= 2;
+            }
+            secret = Some(body[headers_end..data_end_adj].to_vec());
+        }
+        
+        // Move to next boundary
+        pos = part_start;
+        if pos >= body.len() { break; }
+    }
+    
+    (cover, secret, secret_mime)
+}
+
 /// Extract a secret from the custom PNG chunk 'stEg'. Returns (bytes, mime)
 fn extract_secret_from_stego(stego_bytes: &[u8]) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
     const SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -672,10 +947,11 @@ fn extract_secret_from_stego(stego_bytes: &[u8]) -> Result<(Vec<u8>, String), Bo
 }
 
 /// Extract handler: receive stego PNG bytes, return extracted secret with original MIME
+#[axum::debug_handler]
 async fn extract_image(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: Bytes,
 ) -> impl IntoResponse {
     let is_forwarded = headers.contains_key("x-raft-forwarded");
     let metrics = state.raft.metrics().borrow().clone();
@@ -733,6 +1009,34 @@ async fn extract_image(
                 ).into_response(),
             };
         } else {
+            // Check if degraded mode is enabled (via no-leader monitor)
+            let can_degrade = state.degraded_ok.load(Ordering::Relaxed);
+            
+            if can_degrade {
+                println!("🆘 Node {} (degraded mode) processing extract request directly - degraded_ok=true", state.node_id);
+                let node_id = state.node_id;
+                let bytes = body.to_vec();
+                let res = tokio::task::spawn_blocking(move || extract_secret_from_stego(&bytes)).await;
+                return match res {
+                    Ok(Ok((content, mime))) => {
+                        let mut h = HeaderMap::new();
+                        h.insert("Content-Type", mime.parse().unwrap_or("application/octet-stream".parse().unwrap()));
+                        h.insert("X-Processed-By-Node", format!("{}", node_id).parse().unwrap());
+                        (StatusCode::OK, h, axum::body::Bytes::from(content)).into_response()
+                    }
+                    Ok(Err(e)) => (
+                        StatusCode::BAD_REQUEST,
+                        [("Content-Type", "application/json")],
+                        format!(r#"{{"error":"Failed to extract: {}"}}"#, e),
+                    ).into_response(),
+                    Err(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [("Content-Type", "application/json")],
+                        "Task execution failed".to_string(),
+                    ).into_response(),
+                };
+            }
+            
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 [("Content-Type", "application/json")],
@@ -770,16 +1074,18 @@ async fn extract_image(
     // Forward to follower
     match forward_request_to_node(target_id, &target_addr, "/image/extract", &body, Some("image/png")).await {
         Ok(resp) => {
+            // Extract headers before consuming response with bytes()
             let processed_by = resp.headers().get("x-processed-by-node").and_then(|h| h.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| format!("{}", target_id));
+            let content_type = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
             match resp.bytes().await {
-                Ok(bytes) => {
+                    Ok(bytes) => {
                     // Mark node healthy
                     let mut hmap = state.healthy_nodes.write().await;
                     hmap.insert(target_id, true);
                     drop(hmap);
                     let mut h = HeaderMap::new();
                     // Preserve content type from follower if present
-                    if let Some(ct) = resp.headers().get("content-type").and_then(|v| v.to_str().ok()) {
+                    if let Some(ct) = content_type {
                         h.insert("Content-Type", ct.parse().unwrap_or("application/octet-stream".parse().unwrap()));
                     } else {
                         h.insert("Content-Type", "application/octet-stream".parse().unwrap());

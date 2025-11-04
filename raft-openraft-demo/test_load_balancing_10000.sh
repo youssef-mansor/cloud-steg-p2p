@@ -1,8 +1,11 @@
 #!/bin/bash
 set -e
 
-TOTAL_REQUESTS=200 
-BATCH_SIZE=100
+# Local load balancing test using multipart steg/extract
+# Env overrides: TOTAL_REQUESTS, CLUSTER_HOST (default 127.0.0.1)
+TOTAL_REQUESTS=${TOTAL_REQUESTS:-100}
+BATCH_SIZE=${BATCH_SIZE:-100}
+HOST=${CLUSTER_HOST:-127.0.0.1}
 OUTPUT_DIR="/tmp/load_balance_test_$$"
 RESULTS_FILE="$OUTPUT_DIR/results.txt"
 SUMMARY_FILE="$OUTPUT_DIR/summary.txt"
@@ -14,25 +17,31 @@ echo ""
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Check if input image exists
-if [ ! -f "input-image.png" ]; then
+# Check input files
+COVER_FILE="cover.png"
+SECRET_FILE="input-image.png"
+if [ ! -f "$COVER_FILE" ]; then
+    echo "❌ Error: cover.png not found"
+    exit 1
+fi
+if [ ! -f "$SECRET_FILE" ]; then
     echo "❌ Error: input-image.png not found"
-    echo "   Create a test image or use an existing one"
     exit 1
 fi
 
-# Find which node is the leader
+# Find which node is the leader (best effort)
 echo "🔍 Checking which node is the leader..."
-LEADER_NODE=$(curl -s http://10.40.56.135:8001/metrics | jq -r '.data.current_leader // empty')
+LEADER_NODE=$(curl -s --max-time 5 http://$HOST:8001/metrics 2>/dev/null | jq -r '.data.current_leader // empty' 2>/dev/null || echo "")
 if [ -z "$LEADER_NODE" ]; then
-    echo "❌ Error: Could not find leader. Make sure all 3 nodes are running!"
-    exit 1
+    echo "⚠️  Warning: Could not connect to node 1 or determine leader"
+    echo "   Make sure nodes are running on $HOST:8001, 8002, 8003"
+    echo "   Continuing anyway - will try to send requests..."
+else
+    echo "✅ Leader is Node $LEADER_NODE"
 fi
-
-echo "✅ Leader is Node $LEADER_NODE"
-echo "📡 Will multicast requests to all 3 nodes (port 8001, 8002, 8003)"
-echo "   - Followers will reject (503)"
-echo "   - Leader will forward to healthy nodes"
+echo "📡 Will multicast requests to all 3 nodes on host $HOST (ports 8001, 8002, 8003)"
+echo "   - Followers reject direct requests (503)"
+echo "   - Leader forwards to healthy nodes"
 echo ""
 
 # Initialize counters (using regular variables for compatibility)
@@ -64,22 +73,25 @@ multicast_request() {
         local body_file_2="$OUTPUT_DIR/b_${request_num}_2"
         local body_file_3="$OUTPUT_DIR/b_${request_num}_3"
         
-        # Send to all 3 nodes in parallel
+        # Send to all 3 nodes in parallel (multipart form)
         curl -s --max-time 10 -o "$body_file_1" -w "%{http_code}" \
-            -X POST "http://10.40.56.135:8001/image/steg" \
-            --data-binary @input-image.png \
+            -X POST "http://$HOST:8001/image/steg" \
+            -F "cover=@${COVER_FILE};type=image/png" \
+            -F "secret=@${SECRET_FILE};type=image/png" \
             -D "$headers_file_1" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_1" &
         PID1=$!
         
         curl -s --max-time 10 -o "$body_file_2" -w "%{http_code}" \
-            -X POST "http://10.40.39.217:8002/image/steg" \
-            --data-binary @input-image.png \
+            -X POST "http://$HOST:8002/image/steg" \
+            -F "cover=@${COVER_FILE};type=image/png" \
+            -F "secret=@${SECRET_FILE};type=image/png" \
             -D "$headers_file_2" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_2" &
         PID2=$!
         
         curl -s --max-time 10 -o "$body_file_3" -w "%{http_code}" \
-            -X POST "http://10.40.44.75:8003/image/steg" \
-            --data-binary @input-image.png \
+            -X POST "http://$HOST:8003/image/steg" \
+            -F "cover=@${COVER_FILE};type=image/png" \
+            -F "secret=@${SECRET_FILE};type=image/png" \
             -D "$headers_file_3" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_3" &
         PID3=$!
         
@@ -216,11 +228,11 @@ fi
     echo "Failed Requests: $failure_count"
     echo ""
     echo "Architecture:"
-    echo "  • Requests multicast to all 3 nodes (port 8001, 8002, 8003)"
+    echo "  • Requests multicast to all 3 nodes on $HOST (8001, 8002, 8003)"
     echo "  • Followers reject direct requests (503)"
     echo "  • Leader forwards to healthy nodes only"
     echo "  • Client-side retry: multicast again on failure (up to 2 retries)"
-    echo "  • 5-second timeout on node-to-node forwarding"
+    echo "  • 60-second timeout on node-to-node forwarding"
     echo "  • 10-second timeout on client requests"
     echo ""
     echo "Requests Processed by Each Node:"

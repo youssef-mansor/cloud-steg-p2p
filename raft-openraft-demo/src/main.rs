@@ -224,6 +224,7 @@ async fn main() -> Result<()> {
         http_addresses: Arc::new(tokio::sync::RwLock::new(http_addresses)),
         self_http_addr: normalized_self_http,
         healthy_nodes: Arc::new(tokio::sync::RwLock::new(healthy_nodes)),
+        degraded_ok: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     api::start_monitors(app_state.clone());

@@ -24,11 +24,11 @@ OUTPUT_DIR = f"/tmp/load_balance_test_{os.getpid()}"
 RESULTS_FILE = f"{OUTPUT_DIR}/results.txt"
 SUMMARY_FILE = f"{OUTPUT_DIR}/summary.txt"
 
-# Server configuration
+# Server configuration - use localhost for local testing
 SERVERS = [
-    {'id': 1, 'httpAddr': 'http://10.40.56.135:8001'},
-    {'id': 2, 'httpAddr': 'http://10.40.39.217:8002'},
-    {'id': 3, 'httpAddr': 'http://10.40.46.168:8003'},
+    {'id': 1, 'httpAddr': 'http://127.0.0.1:8001'},
+    {'id': 2, 'httpAddr': 'http://127.0.0.1:8002'},
+    {'id': 3, 'httpAddr': 'http://127.0.0.1:8003'},
 ]
 
 # Thread-safe counters

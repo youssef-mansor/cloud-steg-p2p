@@ -29,9 +29,51 @@ pub async fn monitor_single_node(state: Arc<AppState>) {
         // Check if cluster is already initialized (has voters)
         let voters: Vec<NodeId> = membership.voter_ids().collect();
         if !voters.is_empty() {
-            // Cluster is initialized, we're either follower/candidate
-            // Reset alone timer
-            alone_since = None;
+            // Cluster is initialized, check if we're stuck as Candidate with all others down
+            if matches!(current_state, ServerState::Candidate) {
+                // Check if all other voters are unhealthy
+                let http_addrs = state.http_addresses.read().await;
+                let healthy = state.healthy_nodes.read().await;
+                let other_voters_unhealthy = voters.iter()
+                    .filter(|&id| *id != state.node_id)
+                    .all(|id| !healthy.get(id).copied().unwrap_or(false));
+                let voters_count = voters.len();
+                drop(http_addrs);
+                drop(healthy);
+                
+                // If we're the only voter left or all others are unhealthy, try to change membership
+                if voters_count == 1 || (voters_count > 1 && other_voters_unhealthy) {
+                    let node_id = state.node_id;
+                    let state_clone = state.clone();
+                    
+                    // Start timer if not already started
+                    if alone_since.is_none() {
+                        println!("⏱️  Node {} (Candidate) detected all other voters are down, starting timer...", node_id);
+                        alone_since = Some(Instant::now());
+                    } else {
+                        let elapsed = Instant::now().duration_since(alone_since.unwrap());
+                        if elapsed >= promotion_delay {
+                            println!("🎯 Node {} (Candidate) has been alone for {:?}, attempting to fix membership...", node_id, elapsed);
+                            
+                            // Try change_membership (may fail if not leader, but worth trying)
+                            let result = state_clone.raft.change_membership(vec![node_id], true).await;
+                            if result.is_ok() {
+                                println!("✅ Node {} successfully changed membership to [{}] and became leader", node_id, node_id);
+                                alone_since = None;
+                            } else {
+                                // If change_membership fails, we're stuck but degraded mode will handle requests
+                                println!("⚠️  Node {} couldn't change membership (not leader), but will serve requests in degraded mode", node_id);
+                                alone_since = None;
+                            }
+                        }
+                    }
+                } else {
+                    alone_since = None;
+                }
+            } else {
+                // Reset alone timer
+                alone_since = None;
+            }
             continue;
         }
         
