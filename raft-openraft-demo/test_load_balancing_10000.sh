@@ -78,7 +78,7 @@ multicast_request() {
         PID2=$!
         
         curl -s --max-time 10 -o "$body_file_3" -w "%{http_code}" \
-            -X POST "http://10.40.46.168:8003/image/steg" \
+            -X POST "http://10.40.44.75:8003/image/steg" \
             --data-binary @input-image.png \
             -D "$headers_file_3" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_3" &
         PID3=$!
