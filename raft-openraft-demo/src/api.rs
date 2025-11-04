@@ -1,19 +1,19 @@
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, Multipart, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use chacha20poly1305::{aead::Aead, aead::KeyInit, ChaCha20Poly1305, Key, Nonce};
-use openraft::{Raft, RaftMetrics, ServerState};
+use tower_http::limit::RequestBodyLimitLayer;
+use openraft::{Raft, ServerState};
 use openraft_memstore::TypeConfig;
-use rand::rngs::OsRng;
-use rand::{random, RngCore};
+use rand::random;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use png as png_crate;
 
 pub type NodeId = u64;
 pub type RaftNode = Raft<TypeConfig>;
@@ -30,7 +30,7 @@ pub struct AppState {
 }
 
 
-use crate::single_node_monitor;  // ADD THIS AT THE TOP
+// use crate::single_node_monitor;  // unused import; functions referenced directly via crate::single_node_monitor::
 
 /// Start background monitoring tasks for single-node operation
 pub fn start_monitors(state: AppState) {
@@ -86,7 +86,10 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/cluster/add-learner", post(add_learner))
         .route("/cluster/change-membership", post(change_membership))
         .route("/image/echo", post(echo_image))      // Echo: return same image
-        .route("/image/steg", post(steg_image))      // Steganography: embed and return stego image
+        .route("/image/steg", post(steg_image_multipart))      // Steganography: embed and return stego image (multipart)
+        .route("/image/extract", post(extract_image))          // Extract secret from stego image
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // axum extractor limit
+        .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // hyper/tower hard cap
         .with_state(app_state)
 }
 
@@ -191,18 +194,18 @@ async fn forward_request_to_node(
     http_addr: &str,
     path: &str,
     body: &[u8],
+    content_type: Option<&str>,
 ) -> Result<reqwest::Response, String> {
     let url = format!("http://{}{}", http_addr, path);
     // Create client with timeout to avoid hanging on crashed nodes
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-    
-    client
-        .post(&url)
-        .header("X-Raft-Forwarded", "true")
-        .body(body.to_vec())
+
+    let mut req = client.post(&url).header("X-Raft-Forwarded", "true");
+    if let Some(ct) = content_type { req = req.header("Content-Type", ct); }
+    req.body(body.to_vec())
         .send()
         .await
         .map_err(|e| format!("Failed to forward to node {} at {}: {}", node_id, http_addr, e))
@@ -333,7 +336,7 @@ async fn echo_image(
         // Forward to selected node with retry logic
         println!("🔄 Node {} (leader) forwarding echo request to node {} at {}", 
                 state.node_id, target_id, target_addr);
-        match forward_request_to_node(target_id, &target_addr, "/image/echo", &body).await {
+        match forward_request_to_node(target_id, &target_addr, "/image/echo", &body, None).await {
             Ok(response) => {
                 match response.bytes().await {
                     Ok(bytes) => {
@@ -384,182 +387,460 @@ async fn echo_image(
 
 /// Embed image - receive image and return stego image with secret embedded
 /// Load balancing: Followers reject direct requests, Leader forwards randomly
-async fn steg_image(
+async fn steg_image_multipart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    // Parse multipart safely: expect fields 'cover' and 'secret'
+    let mut cover: Option<Vec<u8>> = None;
+    let mut secret: Option<Vec<u8>> = None;
+    let mut secret_mime: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().map(|s| s.to_string()).unwrap_or_default();
+        let fct = field.content_type().map(|m| m.to_string());
+        let bytes = match field.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to read multipart field: {}"}}"#, e),
+                ).into_response();
+            }
+        };
+        if name == "cover" { cover = Some(bytes); }
+        else if name == "secret" { secret = Some(bytes); secret_mime = fct; }
+    }
+
+    let cover = match cover { Some(c) => c, None => return (
+        StatusCode::BAD_REQUEST,
+        [("Content-Type", "application/json")],
+        "Missing 'cover' part".to_string(),
+    ).into_response() };
+    let secret = match secret { Some(s) => s, None => return (
+        StatusCode::BAD_REQUEST,
+        [("Content-Type", "application/json")],
+        "Missing 'secret' part".to_string(),
+    ).into_response() };
+
+    let metrics = state.raft.metrics().borrow().clone();
+    let is_leader = matches!(metrics.state, ServerState::Leader);
+    let is_forwarded = headers.contains_key("x-raft-forwarded");
+
+    // Followers only accept forwarded requests, except in single-node mode
+    if !is_leader && is_forwarded {
+        let node_id = state.node_id;
+        let sm = secret_mime.clone();
+        let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
+        return match res {
+            Ok(Ok(stego_bytes)) => (
+                StatusCode::OK,
+                [("Content-Type", "image/png"), ("X-Processed-By-Node", &format!("{}", node_id))],
+                axum::body::Bytes::from(stego_bytes),
+            ).into_response(),
+            Ok(Err(e)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Content-Type", "application/json")],
+                format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+            ).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Content-Type", "application/json")],
+                "Task execution failed".to_string(),
+            ).into_response(),
+        };
+    } else if !is_leader && !is_forwarded {
+        // Single-node mode: allow direct processing if only self is configured
+        let http_addrs_len = {
+            let map = state.http_addresses.read().await;
+            map.len()
+        };
+        if http_addrs_len == 1 {
+            let node_id = state.node_id;
+            let sm = secret_mime.clone();
+            let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
+            return match res {
+                Ok(Ok(stego_bytes)) => (
+                    StatusCode::OK,
+                    [("Content-Type", "image/png"), ("X-Processed-By-Node", &format!("{}", node_id))],
+                    axum::body::Bytes::from(stego_bytes),
+                ).into_response(),
+                Ok(Err(e)) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                ).into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    "Task execution failed".to_string(),
+                ).into_response(),
+            };
+        } else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Content-Type", "application/json")],
+                format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
+            ).into_response();
+        }
+    }
+
+    // Leader: forward to a randomly selected node (including self)
+    let (target_id, target_addr) = match get_random_node(&state).await { Some(v) => v, None => (state.node_id, state.self_http_addr.clone()) };
+    if target_id == state.node_id {
+        // Process locally
+        let node_id = state.node_id;
+        let sm = secret_mime.clone();
+        let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
+        return match res {
+            Ok(Ok(stego_bytes)) => (
+                StatusCode::OK,
+                [("Content-Type", "image/png"), ("X-Processed-By-Node", &format!("{}", node_id))],
+                axum::body::Bytes::from(stego_bytes),
+            ).into_response(),
+            Ok(Err(e)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Content-Type", "application/json")],
+                format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+            ).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Content-Type", "application/json")],
+                "Task execution failed".to_string(),
+            ).into_response(),
+        };
+    }
+
+    // Build multipart body manually (to avoid enabling reqwest multipart feature)
+    let boundary = format!("----stegBoundary{:x}", rand::random::<u64>());
+    let ct_header = format!("multipart/form-data; boundary={}", boundary);
+    let mut body_bytes: Vec<u8> = Vec::with_capacity(cover.len() + secret.len() + 512);
+    let crlf = b"\r\n";
+
+    // Part: cover
+    body_bytes.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body_bytes.extend_from_slice(b"Content-Disposition: form-data; name=\"cover\"; filename=\"cover.png\"\r\n");
+    body_bytes.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
+    body_bytes.extend_from_slice(&cover);
+    body_bytes.extend_from_slice(crlf);
+
+    // Part: secret
+    let sec_mime = secret_mime.as_deref().unwrap_or("application/octet-stream");
+    body_bytes.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body_bytes.extend_from_slice(b"Content-Disposition: form-data; name=\"secret\"; filename=\"secret\"\r\n");
+    body_bytes.extend_from_slice(format!("Content-Type: {}\r\n\r\n", sec_mime).as_bytes());
+    body_bytes.extend_from_slice(&secret);
+    body_bytes.extend_from_slice(crlf);
+
+    // Closing boundary
+    body_bytes.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    match forward_request_to_node(target_id, &target_addr, "/image/steg", &body_bytes, Some(&ct_header)).await {
+        Ok(r) => {
+            let processed_by = r.headers().get("x-processed-by-node").and_then(|h| h.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| format!("{}", target_id));
+            match r.bytes().await {
+                Ok(bytes) => {
+                    // Mark node healthy
+                    let mut healthy = state.healthy_nodes.write().await;
+                    healthy.insert(target_id, true);
+                    drop(healthy);
+                    let mut h = HeaderMap::new();
+                    h.insert("Content-Type", "image/png".parse().unwrap());
+                    h.insert("X-Processed-By-Node", processed_by.parse().unwrap());
+                    (StatusCode::OK, h, bytes).into_response()
+                }
+                Err(_e) => {
+                    // Mark node unhealthy and process locally as fallback
+                    let mut healthy = state.healthy_nodes.write().await;
+                    healthy.insert(target_id, false);
+                    drop(healthy);
+                    let node_id = state.node_id;
+                    let sm = secret_mime.clone();
+                    let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
+                    return match res {
+                        Ok(Ok(stego_bytes)) => (
+                            StatusCode::OK,
+                            [("Content-Type", "image/png"), ("X-Processed-By-Node", &format!("{}", node_id))],
+                            axum::body::Bytes::from(stego_bytes),
+                        ).into_response(),
+                        Ok(Err(e)) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [("Content-Type", "application/json")],
+                            format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                        ).into_response(),
+                        Err(_) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [("Content-Type", "application/json")],
+                            "Task execution failed".to_string(),
+                        ).into_response(),
+                    };
+                }
+            }
+        }
+        Err(_e) => {
+            // Mark node unhealthy and process locally as fallback
+            let mut healthy = state.healthy_nodes.write().await;
+            healthy.insert(target_id, false);
+            drop(healthy);
+            let node_id = state.node_id;
+            let sm = secret_mime.clone();
+            let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
+            match res {
+                Ok(Ok(stego_bytes)) => (
+                    StatusCode::OK,
+                    [("Content-Type", "image/png"), ("X-Processed-By-Node", &format!("{}", node_id))],
+                    axum::body::Bytes::from(stego_bytes),
+                ).into_response(),
+                Ok(Err(e)) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
+                ).into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    "Task execution failed".to_string(),
+                ).into_response(),
+            }
+        }
+    }
+}
+
+/// Embed secret image bytes into a cover image by adding a custom PNG chunk 'stEg'
+/// The pixel data of the cover is preserved; the secret is stored losslessly.
+fn embed_cover_with_secret_chunk(
+    cover_bytes: &[u8],
+    secret_bytes: &[u8],
+    secret_mime: Option<&str>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    // Re-encode cover as PNG without modifying pixels
+    let cover_img = image::load_from_memory(cover_bytes)?.to_rgba8();
+    let (w, h) = cover_img.dimensions();
+    let raw = cover_img.into_raw();
+
+    // Payload: magic "STG2" | mime_len u16 | mime bytes | data_len u32 | data bytes
+    let mime = secret_mime.unwrap_or("application/octet-stream").as_bytes();
+    let mut payload = Vec::with_capacity(4 + 2 + mime.len() + 4 + secret_bytes.len());
+    payload.extend_from_slice(b"STG2");
+    payload.extend_from_slice(&(mime.len() as u16).to_le_bytes());
+    payload.extend_from_slice(mime);
+    payload.extend_from_slice(&(secret_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(secret_bytes);
+
+    let mut out = Vec::new();
+    let mut encoder = png_crate::Encoder::new(&mut out, w, h);
+    encoder.set_color(png_crate::ColorType::Rgba);
+    encoder.set_depth(png_crate::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&raw)?;
+    // Write custom ancillary chunk 'stEg' (ancillary + safe-to-copy)
+    writer.write_chunk(png_crate::chunk::ChunkType(*b"stEg"), &payload)?;
+    writer.finish()?;
+    Ok(out)
+}
+
+/// Extract a secret from the custom PNG chunk 'stEg'. Returns (bytes, mime)
+fn extract_secret_from_stego(stego_bytes: &[u8]) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+    const SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if stego_bytes.len() < 8 || &stego_bytes[0..8] != SIG { return Err("Not a PNG".into()); }
+    let mut i = 8usize;
+    while i + 12 <= stego_bytes.len() {
+        let len = u32::from_be_bytes(stego_bytes[i..i+4].try_into().unwrap()) as usize; i += 4;
+        let ctype = &stego_bytes[i..i+4]; i += 4;
+        if ctype == b"stEg" {
+            if i + len + 4 > stego_bytes.len() { return Err("Chunk truncated".into()); }
+            let data = &stego_bytes[i..i+len];
+            // Parse payload: magic STG2 | mime_len u16 | mime | data_len u32 | data
+            if data.len() < 4+2+4 { return Err("Payload too small".into()); }
+            if &data[0..4] != b"STG2" { return Err("Wrong payload magic".into()); }
+            let ml = u16::from_le_bytes([data[4],data[5]]) as usize;
+            if data.len() < 6 + ml + 4 { return Err("Payload malformed".into()); }
+            let mime = std::str::from_utf8(&data[6..6+ml]).unwrap_or("application/octet-stream").to_string();
+            let dl_off = 6+ml;
+            let dlen = u32::from_le_bytes([data[dl_off],data[dl_off+1],data[dl_off+2],data[dl_off+3]]) as usize;
+            if data.len() < dl_off+4 + dlen { return Err("Payload data truncated".into()); }
+            let content = data[dl_off+4 .. dl_off+4+dlen].to_vec();
+            return Ok((content, mime));
+        } else {
+            // skip data + CRC
+            i += len + 4; // data + CRC
+        }
+    }
+    Err("stEg chunk not found".into())
+}
+
+/// Extract handler: receive stego PNG bytes, return extracted secret with original MIME
+async fn extract_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let image_size = body.len();
-    
-    // Check if image is too large (max 1MB for safety)
-    if image_size > 1_048_576 {
-        return (
-            StatusCode::BAD_REQUEST,
-            [("Content-Type", "application/json")],
-            format!(r#"{{"error": "Image too large (max 1MB), received {} bytes"}}"#, image_size),
-        ).into_response();
-    }
-    
-    // Check if this is a forwarded request from the leader
     let is_forwarded = headers.contains_key("x-raft-forwarded");
-    
-    // Check if we're the leader
     let metrics = state.raft.metrics().borrow().clone();
     let is_leader = matches!(metrics.state, ServerState::Leader);
-    
-    // Followers only accept forwarded requests, not direct client requests
-    if !is_leader && !is_forwarded {
-        println!("🚫 Node {} (follower) dropping direct steg request - only leader processes direct requests", state.node_id);
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [("Content-Type", "application/json")],
-            format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
-        ).into_response();
-    }
-    
-    // If forwarded request and we're a follower, process it
+
+    // Followers only accept forwarded requests, except in single-node mode
     if !is_leader && is_forwarded {
-        println!("📥 Node {} (follower) processing forwarded steg request: {} bytes", state.node_id, image_size);
-        println!("🔐 Starting steganography embedding...");
-        println!("🔒 Encrypting and embedding image...");
-        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
-        let body_clone = body.clone();
         let node_id = state.node_id;
-        match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
-            Ok(Ok(stego_bytes)) => {
-                println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
-                         node_id, stego_bytes.len(), image_size);
-                return (
-                    StatusCode::OK,
-                    [
-                        ("Content-Type", "image/png"),
-                        ("X-Processed-By-Node", &format!("{}", node_id)),
-                    ],
-                    axum::body::Bytes::from(stego_bytes),
-                ).into_response();
+        let bytes = body.to_vec();
+        let res = tokio::task::spawn_blocking(move || extract_secret_from_stego(&bytes)).await;
+        return match res {
+            Ok(Ok((content, mime))) => {
+                let mut h = HeaderMap::new();
+                h.insert("Content-Type", mime.parse().unwrap_or("application/octet-stream".parse().unwrap()));
+                h.insert("X-Processed-By-Node", format!("{}", node_id).parse().unwrap());
+                (StatusCode::OK, h, axum::body::Bytes::from(content)).into_response()
             }
-            Ok(Err(e)) => {
-                eprintln!("❌ Node {} failed to embed image: {}", node_id, e);
-                return (
+            Ok(Err(e)) => (
+                StatusCode::BAD_REQUEST,
+                [("Content-Type", "application/json")],
+                format!(r#"{{"error":"Failed to extract: {}"}}"#, e),
+            ).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Content-Type", "application/json")],
+                "Task execution failed".to_string(),
+            ).into_response(),
+        };
+    } else if !is_leader && !is_forwarded {
+        // Single-node mode: allow direct requests if only self is configured
+        let http_addrs_len = {
+            let map = state.http_addresses.read().await;
+            map.len()
+        };
+        if http_addrs_len == 1 {
+            let node_id = state.node_id;
+            let bytes = body.to_vec();
+            let res = tokio::task::spawn_blocking(move || extract_secret_from_stego(&bytes)).await;
+            return match res {
+                Ok(Ok((content, mime))) => {
+                    let mut h = HeaderMap::new();
+                    h.insert("Content-Type", mime.parse().unwrap_or("application/octet-stream".parse().unwrap()));
+                    h.insert("X-Processed-By-Node", format!("{}", node_id).parse().unwrap());
+                    (StatusCode::OK, h, axum::body::Bytes::from(content)).into_response()
+                }
+                Ok(Err(e)) => (
+                    StatusCode::BAD_REQUEST,
+                    [("Content-Type", "application/json")],
+                    format!(r#"{{"error":"Failed to extract: {}"}}"#, e),
+                ).into_response(),
+                Err(_) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
-                ).into_response();
-            }
-            Err(e) => {
-                eprintln!("❌ Node {} task join error: {}", node_id, e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Task execution failed"}}"#),
-                ).into_response();
-            }
+                    "Task execution failed".to_string(),
+                ).into_response(),
+            };
+        } else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Content-Type", "application/json")],
+                format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
+            ).into_response();
         }
     }
-    
-    // Leader: randomly assign to a node (including self)
-    let (target_id, target_addr) = match get_random_node(&state).await {
-        Some(addr) => addr,
-        None => {
-            println!("⚠️  No available nodes for forwarding, processing locally");
-            (state.node_id, state.self_http_addr.clone())
-        }
-    };
-    
+
+    // Leader: forward to selected node including self
+    let (target_id, target_addr) = match get_random_node(&state).await { Some(v) => v, None => (state.node_id, state.self_http_addr.clone()) };
     if target_id == state.node_id {
-        // Process locally
-        println!("📥 Node {} (leader) processing steg request locally: {} bytes", state.node_id, image_size);
-        println!("🔐 Starting steganography embedding...");
-        println!("🔒 Encrypting and embedding image...");
-        // Spawn CPU-intensive image processing in blocking task to avoid blocking async runtime
-        let body_clone = body.clone();
         let node_id = state.node_id;
-        match tokio::task::spawn_blocking(move || embed_image_into_cover(&body_clone[..])).await {
-            Ok(Ok(stego_bytes)) => {
-                println!("✅ Node {} created stego image: {} bytes (original: {} bytes)", 
-                         node_id, stego_bytes.len(), image_size);
-                (
-                    StatusCode::OK,
-                    [
-                        ("Content-Type", "image/png"),
-                        ("X-Processed-By-Node", &format!("{}", node_id)),
-                    ],
-                    axum::body::Bytes::from(stego_bytes),
-                ).into_response()
+        let bytes = body.to_vec();
+        let res = tokio::task::spawn_blocking(move || extract_secret_from_stego(&bytes)).await;
+        return match res {
+            Ok(Ok((content, mime))) => {
+                let mut h = HeaderMap::new();
+                h.insert("Content-Type", mime.parse().unwrap_or("application/octet-stream".parse().unwrap()));
+                h.insert("X-Processed-By-Node", format!("{}", node_id).parse().unwrap());
+                (StatusCode::OK, h, axum::body::Bytes::from(content)).into_response()
             }
-            Ok(Err(e)) => {
-                eprintln!("❌ Node {} failed to embed image: {}", node_id, e);
-                eprintln!("   Error details: {:?}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to embed image: {}"}}"#, e),
-                ).into_response()
-            }
-            Err(e) => {
-                eprintln!("❌ Node {} task join error: {}", node_id, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Task execution failed"}}"#),
-                ).into_response()
-            }
-        }
-    } else {
-        // Forward to selected node with retry logic
-        println!("🔄 Node {} (leader) forwarding steg request to node {} at {}", 
-                state.node_id, target_id, target_addr);
-        match forward_request_to_node(target_id, &target_addr, "/image/steg", &body).await {
-            Ok(response) => {
-                // Extract X-Processed-By-Node header from forwarded response
-                let processed_by = response.headers()
-                    .get("x-processed-by-node")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{}", target_id));
-                
-                match response.bytes().await {
-                    Ok(bytes) => {
-                        println!("✅ Received stego image from node {}: {} bytes", target_id, bytes.len());
-                        // Mark node as healthy on successful response
-                        let mut healthy = state.healthy_nodes.write().await;
-                        healthy.insert(target_id, true);
-                        drop(healthy);
-                        
-                        let mut headers = HeaderMap::new();
-                        headers.insert("Content-Type", "image/png".parse().unwrap());
-                        headers.insert("X-Processed-By-Node", processed_by.parse().unwrap());
-                        (StatusCode::OK, headers, bytes).into_response()
+            Ok(Err(e)) => (
+                StatusCode::BAD_REQUEST,
+                [("Content-Type", "application/json")],
+                format!(r#"{{"error":"Failed to extract: {}"}}"#, e),
+            ).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Content-Type", "application/json")],
+                "Task execution failed".to_string(),
+            ).into_response(),
+        };
+    }
+
+    // Forward to follower
+    match forward_request_to_node(target_id, &target_addr, "/image/extract", &body, Some("image/png")).await {
+        Ok(resp) => {
+            let processed_by = resp.headers().get("x-processed-by-node").and_then(|h| h.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| format!("{}", target_id));
+            match resp.bytes().await {
+                Ok(bytes) => {
+                    // Mark node healthy
+                    let mut hmap = state.healthy_nodes.write().await;
+                    hmap.insert(target_id, true);
+                    drop(hmap);
+                    let mut h = HeaderMap::new();
+                    // Preserve content type from follower if present
+                    if let Some(ct) = resp.headers().get("content-type").and_then(|v| v.to_str().ok()) {
+                        h.insert("Content-Type", ct.parse().unwrap_or("application/octet-stream".parse().unwrap()));
+                    } else {
+                        h.insert("Content-Type", "application/octet-stream".parse().unwrap());
                     }
-                    Err(e) => {
-                        eprintln!("❌ Failed to read response from node {}: {}", target_id, e);
-                        // Mark node as unhealthy
-                        let mut healthy = state.healthy_nodes.write().await;
-                        healthy.insert(target_id, false);
-                        drop(healthy);
-                        
-                        // Return error - client should retry
-                        (
-                            StatusCode::BAD_GATEWAY,
+                    h.insert("X-Processed-By-Node", processed_by.parse().unwrap());
+                    (StatusCode::OK, h, bytes).into_response()
+                }
+                Err(_e) => {
+                    // Fallback: mark unhealthy and process locally
+                    let mut hmap = state.healthy_nodes.write().await;
+                    hmap.insert(target_id, false);
+                    drop(hmap);
+                    let node_id = state.node_id;
+                    let bytes_local = body.to_vec();
+                    let res = tokio::task::spawn_blocking(move || extract_secret_from_stego(&bytes_local)).await;
+                    return match res {
+                        Ok(Ok((content, mime))) => {
+                            let mut h = HeaderMap::new();
+                            h.insert("Content-Type", mime.parse().unwrap_or("application/octet-stream".parse().unwrap()));
+                            h.insert("X-Processed-By-Node", format!("{}", node_id).parse().unwrap());
+                            (StatusCode::OK, h, axum::body::Bytes::from(content)).into_response()
+                        }
+                        Ok(Err(e)) => (
+                            StatusCode::BAD_REQUEST,
                             [("Content-Type", "application/json")],
-                            format!(r#"{{"error": "Failed to read response from node {}"}}"#, target_id),
-                        ).into_response()
-                    }
+                            format!(r#"{{"error":"Failed to extract: {}"}}"#, e),
+                        ).into_response(),
+                        Err(_) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [("Content-Type", "application/json")],
+                            "Task execution failed".to_string(),
+                        ).into_response(),
+                    };
                 }
             }
-            Err(e) => {
-                eprintln!("❌ Failed to forward to node {}: {} - marking as unhealthy", target_id, e);
-                // Mark node as unhealthy when forwarding fails
-                let mut healthy = state.healthy_nodes.write().await;
-                healthy.insert(target_id, false);
-                drop(healthy);
-                
-                // Return error - client should retry (multicast again)
-                (
-                    StatusCode::BAD_GATEWAY,
+        }
+        Err(_e) => {
+            // Fallback: mark unhealthy and process locally
+            let mut hmap = state.healthy_nodes.write().await;
+            hmap.insert(target_id, false);
+            drop(hmap);
+            let node_id = state.node_id;
+            let bytes_local = body.to_vec();
+            let res = tokio::task::spawn_blocking(move || extract_secret_from_stego(&bytes_local)).await;
+            match res {
+                Ok(Ok((content, mime))) => {
+                    let mut h = HeaderMap::new();
+                    h.insert("Content-Type", mime.parse().unwrap_or("application/octet-stream".parse().unwrap()));
+                    h.insert("X-Processed-By-Node", format!("{}", node_id).parse().unwrap());
+                    (StatusCode::OK, h, axum::body::Bytes::from(content)).into_response()
+                }
+                Ok(Err(e)) => (
+                    StatusCode::BAD_REQUEST,
                     [("Content-Type", "application/json")],
-                    format!(r#"{{"error": "Failed to forward to node {}: {}"}}"#, target_id, e),
-                ).into_response()
+                    format!(r#"{{"error":"Failed to extract: {}"}}"#, e),
+                ).into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("Content-Type", "application/json")],
+                    "Task execution failed".to_string(),
+                ).into_response(),
             }
         }
     }
@@ -567,94 +848,7 @@ async fn steg_image(
 
 /// Embed secret image bytes into a cover image using steganography
 /// Returns PNG bytes of the stego image
-fn embed_image_into_cover(secret_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    // Generate encryption key
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    
-    // Encrypt secret using ChaCha20Poly1305
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, secret_bytes)
-        .map_err(|e| format!("encrypt failed: {}", e))?;
-
-    // Build payload: [4 bytes len][12 bytes nonce][ciphertext]
-    let ct_len = ciphertext.len() as u32;
-    let mut payload = Vec::with_capacity(4 + 12 + ciphertext.len());
-    payload.extend_from_slice(&ct_len.to_le_bytes());
-    payload.extend_from_slice(&nonce_bytes);
-    payload.extend_from_slice(&ciphertext);
-
-    // Calculate cover size needed (payload bits / 3 bits per pixel)
-    let payload_bits = payload.len() * 8;
-    let needed_pixels = (payload_bits + 2) / 3; // ceil(bits/3)
-    let side = ((needed_pixels as f64).sqrt().ceil() as u32).max(512u32); // min 512x512
-
-    // Create cover image in memory
-    let mut cover_img = image::RgbaImage::new(side, side);
-    for pixel in cover_img.pixels_mut() {
-        *pixel = image::Rgba([180u8, 200u8, 255u8, 255u8]);
-    }
-
-    let capacity_bits = (side as usize) * (side as usize) * 3;
-    if payload_bits > capacity_bits {
-        return Err("Payload too large for cover".into());
-    }
-
-    // Convert payload to bits (LSB-first per byte)
-    let mut bits = Vec::with_capacity(payload_bits);
-    for &b in payload.iter() {
-        for i in 0..8 {
-            bits.push(((b >> i) & 1u8) != 0);
-        }
-    }
-
-    // Embed bits into cover using LSB of R, G, B channels
-    let (width, height) = cover_img.dimensions();
-    let mut raw_bytes = cover_img.into_raw();
-    let mut bit_idx = 0usize;
-    
-    for pixel_chunk in raw_bytes.chunks_exact_mut(4) {
-        if bit_idx >= bits.len() {
-            break;
-        }
-        
-        // Embed in R channel
-        if bit_idx < bits.len() {
-            pixel_chunk[0] = (pixel_chunk[0] & 0xFE) | (bits[bit_idx] as u8);
-            bit_idx += 1;
-        }
-        
-        // Embed in G channel
-        if bit_idx < bits.len() {
-            pixel_chunk[1] = (pixel_chunk[1] & 0xFE) | (bits[bit_idx] as u8);
-            bit_idx += 1;
-        }
-        
-        // Embed in B channel
-        if bit_idx < bits.len() {
-            pixel_chunk[2] = (pixel_chunk[2] & 0xFE) | (bits[bit_idx] as u8);
-            bit_idx += 1;
-        }
-        
-        // Alpha channel unchanged
-    }
-    
-    // Rebuild image from manipulated raw bytes
-    let stego_img = image::RgbaImage::from_raw(width, height, raw_bytes)
-        .ok_or("Failed to rebuild image from raw bytes")?;
-
-    // Encode PNG to bytes in memory
-    let mut png_bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(stego_img)
-        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageOutputFormat::Png)?;
-    
-    Ok(png_bytes)
-}
+// Replaced legacy LSB-based approach with PNG ancillary chunk approach above
 
 /// Error wrapper
 struct AppError(String);
