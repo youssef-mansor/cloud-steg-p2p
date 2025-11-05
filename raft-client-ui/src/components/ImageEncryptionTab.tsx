@@ -87,6 +87,7 @@ export function ImageEncryptionTab() {
   const handleDownload = () => {
     if (!encryptedBlob) return;
 
+    console.log(`💾 Downloading encrypted stego image: size=${encryptedBlob.size} bytes, type=${encryptedBlob.type}`);
     const url = URL.createObjectURL(encryptedBlob);
     const a = document.createElement('a');
     a.href = url;
@@ -110,6 +111,7 @@ export function ImageEncryptionTab() {
         setDecryptingNode(result.nodeId || null);
         setDecryptLatency(result.latency);
         console.log(`✅ Extraction succeeded on node ${result.nodeId}, latency: ${result.latency}ms`);
+        console.log(`📦 Decrypted blob: size=${result.data.size} bytes, type=${result.data.type}`);
       } else {
         console.error(`❌ Extraction failed: ${result.error}`);
         alert(`❌ Extraction failed:\n\n${result.error}\n\nPlease check:\n1. The stego image is intact\n2. At least one server node is running\n\nCheck browser console for more details.`);
@@ -132,10 +134,23 @@ export function ImageEncryptionTab() {
   const handleDownloadDecrypted = () => {
     if (!decryptedBlob) return;
 
+    // Determine file extension from MIME type
+    let extension = 'png';
+    if (decryptedBlob.type.includes('jpeg') || decryptedBlob.type.includes('jpg')) {
+      extension = 'jpg';
+    } else if (decryptedBlob.type.includes('png')) {
+      extension = 'png';
+    } else if (decryptedBlob.type.includes('gif')) {
+      extension = 'gif';
+    } else if (decryptedBlob.type.includes('webp')) {
+      extension = 'webp';
+    }
+    
+    console.log(`💾 Downloading extracted secret image: size=${decryptedBlob.size} bytes, type=${decryptedBlob.type}, extension=${extension}`);
     const url = URL.createObjectURL(decryptedBlob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'decrypted-image.png';
+    a.download = `extracted-secret.${extension}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

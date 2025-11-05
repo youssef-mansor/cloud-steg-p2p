@@ -285,9 +285,11 @@ export class RaftApiClient {
               const processedByHeader = response.headers.get('X-Processed-By-Node');
               const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : leaderId;
 
+              // Get the content type from response headers (backend sets it based on extracted MIME)
+              const contentType = response.headers.get('Content-Type') || 'image/png';
               const arrayBufferResponse = await response.arrayBuffer();
-              const blob = new Blob([arrayBufferResponse], { type: 'image/png' });
-              console.log(`✅ Leader Node ${leaderId} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${nodeLatency.toFixed(0)}ms`);
+              const blob = new Blob([arrayBufferResponse], { type: contentType });
+              console.log(`✅ Leader Node ${leaderId} succeeded: processed by node ${processedBy}, received ${blob.size} bytes (${contentType}), latency: ${nodeLatency.toFixed(0)}ms`);
               
               const totalLatency = performance.now() - startTime;
               return { 
@@ -339,10 +341,11 @@ export class RaftApiClient {
             const processedByHeader = response.headers.get('X-Processed-By-Node');
             const processedBy = processedByHeader ? parseInt(processedByHeader, 10) : node.id;
 
-            // Get the raw bytes and create a blob with image/png type
+            // Get the content type from response headers (backend sets it based on extracted MIME)
+            const contentType = response.headers.get('Content-Type') || 'image/png';
             const arrayBufferResponse = await response.arrayBuffer();
-            const blob = new Blob([arrayBufferResponse], { type: 'image/png' });
-            console.log(`✅ Node ${node.id} succeeded: processed by node ${processedBy}, received ${blob.size} bytes, latency: ${nodeLatency.toFixed(0)}ms`);
+            const blob = new Blob([arrayBufferResponse], { type: contentType });
+            console.log(`✅ Node ${node.id} succeeded: processed by node ${processedBy}, received ${blob.size} bytes (${contentType}), latency: ${nodeLatency.toFixed(0)}ms`);
             
             return { 
               success: true, 
