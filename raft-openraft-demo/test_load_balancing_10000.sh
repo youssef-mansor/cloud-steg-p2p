@@ -1,11 +1,13 @@
 #!/bin/bash
 set -e
 
-# Local load balancing test using multipart steg/extract
-# Env overrides: TOTAL_REQUESTS, CLUSTER_HOST (default 127.0.0.1)
+# Distributed load balancing test using multipart steg/extract
+# Env overrides: TOTAL_REQUESTS, CLUSTER_HOST_1, CLUSTER_HOST_2, CLUSTER_HOST_3
 TOTAL_REQUESTS=${TOTAL_REQUESTS:-100}
 BATCH_SIZE=${BATCH_SIZE:-100}
-HOST=${CLUSTER_HOST:-127.0.0.1}
+HOST1=${CLUSTER_HOST_1:-10.40.56.135}
+HOST2=${CLUSTER_HOST_2:-10.40.42.221}
+HOST3=${CLUSTER_HOST_3:-10.40.44.75}
 OUTPUT_DIR="/tmp/load_balance_test_$$"
 RESULTS_FILE="$OUTPUT_DIR/results.txt"
 SUMMARY_FILE="$OUTPUT_DIR/summary.txt"
@@ -29,17 +31,20 @@ if [ ! -f "$SECRET_FILE" ]; then
     exit 1
 fi
 
-# Find which node is the leader (best effort)
-echo "🔍 Checking which node is the leader..."
-LEADER_NODE=$(curl -s --max-time 5 http://$HOST:8001/metrics 2>/dev/null | jq -r '.data.current_leader // empty' 2>/dev/null || echo "")
+# Find which node is the leader (best effort via node 1)
+echo "🔍 Checking which node is the leader (via $HOST1:8001)..."
+LEADER_NODE=$(curl -s --max-time 5 http://$HOST1:8001/metrics 2>/dev/null | jq -r '.data.current_leader // empty' 2>/dev/null || echo "")
 if [ -z "$LEADER_NODE" ]; then
     echo "⚠️  Warning: Could not connect to node 1 or determine leader"
-    echo "   Make sure nodes are running on $HOST:8001, 8002, 8003"
+    echo "   Make sure nodes are running on $HOST1:8001, $HOST2:8002, $HOST3:8003"
     echo "   Continuing anyway - will try to send requests..."
 else
     echo "✅ Leader is Node $LEADER_NODE"
 fi
-echo "📡 Will multicast requests to all 3 nodes on host $HOST (ports 8001, 8002, 8003)"
+echo "📡 Will multicast requests to:"
+echo "   - Node 1: $HOST1:8001"
+echo "   - Node 2: $HOST2:8002"
+echo "   - Node 3: $HOST3:8003"
 echo "   - Followers reject direct requests (503)"
 echo "   - Leader forwards to healthy nodes"
 echo ""
@@ -75,21 +80,21 @@ multicast_request() {
         
         # Send to all 3 nodes in parallel (multipart form)
         curl -s --max-time 10 -o "$body_file_1" -w "%{http_code}" \
-            -X POST "http://$HOST:8001/image/steg" \
+            -X POST "http://$HOST1:8001/image/steg" \
             -F "cover=@${COVER_FILE};type=image/png" \
             -F "secret=@${SECRET_FILE};type=image/png" \
             -D "$headers_file_1" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_1" &
         PID1=$!
         
         curl -s --max-time 10 -o "$body_file_2" -w "%{http_code}" \
-            -X POST "http://$HOST:8002/image/steg" \
+            -X POST "http://$HOST2:8002/image/steg" \
             -F "cover=@${COVER_FILE};type=image/png" \
             -F "secret=@${SECRET_FILE};type=image/png" \
             -D "$headers_file_2" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_2" &
         PID2=$!
         
         curl -s --max-time 10 -o "$body_file_3" -w "%{http_code}" \
-            -X POST "http://$HOST:8003/image/steg" \
+            -X POST "http://$HOST3:8003/image/steg" \
             -F "cover=@${COVER_FILE};type=image/png" \
             -F "secret=@${SECRET_FILE};type=image/png" \
             -D "$headers_file_3" 2>/dev/null > "$OUTPUT_DIR/code_${request_num}_3" &
@@ -228,7 +233,7 @@ fi
     echo "Failed Requests: $failure_count"
     echo ""
     echo "Architecture:"
-    echo "  • Requests multicast to all 3 nodes on $HOST (8001, 8002, 8003)"
+    echo "  • Requests multicast to: $HOST1:8001, $HOST2:8002, $HOST3:8003"
     echo "  • Followers reject direct requests (503)"
     echo "  • Leader forwards to healthy nodes only"
     echo "  • Client-side retry: multicast again on failure (up to 2 retries)"

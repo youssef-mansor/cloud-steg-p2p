@@ -440,8 +440,8 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
     if healthy_node_ids.is_empty() {
         // No healthy nodes (shouldn't happen since self is always healthy), fallback to self
         println!("⚠️ No healthy nodes found, using self as fallback");
-        return Some((state.node_id, state.self_http_addr.clone()));
-    }
+            return Some((state.node_id, state.self_http_addr.clone()));
+        }
     
     // If self is the only healthy node, always select self
     if healthy_node_ids.len() == 1 && healthy_node_ids[0] == state.node_id {
@@ -465,7 +465,7 @@ async fn get_random_node(state: &AppState) -> Option<(NodeId, String)> {
         } else {
             http_addrs.get(&selected_id)?.clone()
         };
-        Some((selected_id, addr))
+    Some((selected_id, addr))
     } else {
         // Only self is healthy
         Some((state.node_id, state.self_http_addr.clone()))
@@ -493,12 +493,12 @@ async fn echo_image(
         // Check if degraded mode is enabled
         let can_degrade = state.degraded_ok.load(Ordering::Relaxed);
         if !can_degrade {
-            println!("🚫 Node {} (follower) dropping direct echo request - only leader processes direct requests", state.node_id);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("Content-Type", "application/json")],
-                format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
-            ).into_response();
+        println!("🚫 Node {} (follower) dropping direct echo request - only leader processes direct requests", state.node_id);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            format!(r#"{{"error": "Node {} is not the leader. Request dropped."}}"#, state.node_id),
+        ).into_response();
         }
         // Degraded mode: process request
         println!("🆘 Node {} (degraded mode) processing echo request directly - degraded_ok=true", state.node_id);
@@ -727,7 +727,7 @@ async fn steg_image_multipart(
             
             if can_degrade {
                 println!("🆘 Node {} (degraded mode) processing steg request directly - degraded_ok=true", state.node_id);
-                let node_id = state.node_id;
+        let node_id = state.node_id;
                 let sm = secret_mime.clone();
                 let res = tokio::task::spawn_blocking(move || embed_cover_with_secret_chunk(&cover, &secret, sm.as_deref())).await;
                 return match res {
@@ -756,9 +756,9 @@ async fn steg_image_multipart(
                 ).into_response();
         }
     }
-
+    
     // Leader: forward to a randomly selected node (including self)
-    let (target_id, target_addr) = match get_random_node(&state).await { 
+    let (target_id, target_addr) = match get_random_node(&state).await {
         Some(v) => v, 
         None => {
             // No nodes available, process locally as fallback
@@ -834,7 +834,7 @@ async fn steg_image_multipart(
                         let mut healthy = state.healthy_nodes.write().await;
                         healthy.insert(target_id, true);
                         drop(healthy);
-                    
+                        
                     // Track throughput for the node that processed it (atomic, no lock needed)
                     if let Ok(proc_node_id) = processed_by.parse::<NodeId>() {
                         match proc_node_id {

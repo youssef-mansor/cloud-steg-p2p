@@ -1,12 +1,11 @@
 import type { ApiResponse, NodeMetrics } from '../types';
 
 // Default server addresses - can be configured
-// Local testing: http://127.0.0.1:8001/2/3
-// Distributed: http://10.40.49.211:8001, http://10.40.41.162:8002, http://10.40.46.168:8003
+// Distributed: Node1/2/3 on provided hosts
 const DEFAULT_NODES = [
-  { id: 1, httpAddr: 'http://127.0.0.1:8001' },
-  { id: 2, httpAddr: 'http://127.0.0.1:8002' },
-  { id: 3, httpAddr: 'http://127.0.0.1:8003' },
+  { id: 1, httpAddr: 'http://10.40.56.135:8001' },
+  { id: 2, httpAddr: 'http://10.40.42.221:8002' },
+  { id: 3, httpAddr: 'http://10.40.44.75:8003' },
 ];
 
 export class RaftApiClient {

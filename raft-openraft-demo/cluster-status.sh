@@ -1,16 +1,18 @@
 #!/bin/bash
 set -e
 
-# Local cluster status checker
-# Usage: CLUSTER_HOST=127.0.0.1 ./cluster-status.sh
+# Distributed cluster status checker
+# Usage (override optional): CLUSTER_HOST_1=... CLUSTER_HOST_2=... CLUSTER_HOST_3=... ./cluster-status.sh
 
-HOST="${CLUSTER_HOST:-127.0.0.1}"
+HOST1="${CLUSTER_HOST_1:-10.40.56.135}"
+HOST2="${CLUSTER_HOST_2:-10.40.42.221}"
+HOST3="${CLUSTER_HOST_3:-10.40.44.75}"
 
 echo ""
-echo "📊 Cluster Status (host: $HOST):"
-echo -n "  Node 1: "
-curl -s http://$HOST:8001/metrics | jq -r .data.state
-echo -n "  Node 2: "
-curl -s http://$HOST:8002/metrics | jq -r .data.state
-echo -n "  Node 3: "
-curl -s http://$HOST:8003/metrics | jq -r .data.state
+echo "📊 Cluster Status:"
+echo -n "  Node 1 ($HOST1): "
+curl -s http://$HOST1:8001/metrics | jq -r .data.state
+echo -n "  Node 2 ($HOST2): "
+curl -s http://$HOST2:8002/metrics | jq -r .data.state
+echo -n "  Node 3 ($HOST3): "
+curl -s http://$HOST3:8003/metrics | jq -r .data.state

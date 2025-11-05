@@ -24,38 +24,38 @@ ls input-image.png  # Should exist
 
 ### Step-by-Step Terminal Instructions
 
-#### Terminal 1 - Node 1 (Leader Candidate)
+#### Terminal 1 - Node 1 (Leader Candidate) on 10.40.56.135
 ```bash
 cd raft-openraft-demo
 cargo run --release -- \
   --id 1 \
   --http-addr 0.0.0.0:8001 \
   --rpc-addr 0.0.0.0:7001 \
-  --peers "2=127.0.0.1:7002,3=127.0.0.1:7003"
+  --peers "2=10.40.42.221:7002,3=10.40.44.75:7003"
 ```
 
 **Wait for:** `🌐 HTTP API listening on 0.0.0.0:8001`
 
-#### Terminal 2 - Node 2 (Follower)
+#### Terminal 2 - Node 2 (Follower) on 10.40.42.221
 ```bash
 cd raft-openraft-demo
 cargo run --release -- \
   --id 2 \
   --http-addr 0.0.0.0:8002 \
   --rpc-addr 0.0.0.0:7002 \
-  --peers "1=127.0.0.1:7001,3=127.0.0.1:7003"
+  --peers "1=10.40.56.135:7001,3=10.40.44.75:7003"
 ```
 
 **Wait for:** `🌐 HTTP API listening on 0.0.0.0:8002`
 
-#### Terminal 3 - Node 3 (Follower)
+#### Terminal 3 - Node 3 (Follower) on 10.40.44.75
 ```bash
 cd raft-openraft-demo
 cargo run --release -- \
   --id 3 \
   --http-addr 0.0.0.0:8003 \
   --rpc-addr 0.0.0.0:7003 \
-  --peers "1=127.0.0.1:7001,2=127.0.0.1:7002"
+  --peers "1=10.40.56.135:7001,2=10.40.42.221:7002"
 ```
 
 **Wait for:** `🌐 HTTP API listening on 0.0.0.0:8003`
